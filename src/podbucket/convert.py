@@ -6,6 +6,7 @@ from pathlib import Path
 
 from marctable import to_parquet
 from podbucket.resourcesync import download
+from pymarc.marcxml import parse_xml_to_array
 
 
 logger = logging.getLogger(__name__)
@@ -21,7 +22,8 @@ def marcxml_to_parquet(marcxml_url: str, output_dir: Path):
     logger.info(f"downloading {marcxml_url} to {marcxml_gz_path}")
     download(marcxml_url, marcxml_gz_path)
     decompress(marcxml_gz_path, marcxml_path)
-    to_parquet(marcxml_path, parquet_path)
+    records = parse_xml_to_array(marcxml_path)
+    to_parquet(records, parquet_path)
 
     return parquet_path
 

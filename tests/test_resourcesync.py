@@ -3,7 +3,7 @@ from podbucket import resourcesync
 
 def test_get_streams():
     streams = resourcesync.get_streams()
-    assert len(streams) == 18
+    assert len(streams) == 13
     assert (
         streams["stanford"]
         == "https://pod.stanford.edu/organizations/stanford/streams/2024-08-27/normalized_resourcelist/marcxml"
@@ -30,8 +30,8 @@ def test_get_resources():
 
 def test_download(tmp_path):
     test_file = resourcesync.download(
-        "https://pod.stanford.edu/file/475329/stanford-2025-05-26-delta-marcxml.xml.gz",
+        "https://pod.stanford.edu/file/653722/stanford-2026-03-29T04-15-59-delta-marcxml.xml.gz",
         tmp_path / "test.xml.gz",
     )
     assert test_file.is_file()
-    assert test_file.stat().st_size == 20573
+    assert test_file.stat().st_size == 1416574
