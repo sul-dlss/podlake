@@ -1,16 +1,18 @@
 import pandas
 
-from podbucket.convert import marcxml_to_parquet
+from podlake.convert import oai_to_parquet
 
 
 def test_convert(tmp_path):
-    marcxml_url = (
-        "https://pod.stanford.edu/file/653722/stanford-2026-03-29T04-15-59-delta-marcxml.xml.gz"
-    )
-
-    parquet_path = marcxml_to_parquet(marcxml_url, output_dir=tmp_path)
+    parquet_path = tmp_path / "test.parquet"
+    oai_to_parquet("stanford", parquet_path=parquet_path, limit=2000)
     assert parquet_path.is_file()
 
     df = pandas.read_parquet(parquet_path)
-    assert len(df) > 0
-    assert df["F245"].iloc[0] == "25 études mélodiques et très faciles  : pour violon : précédées chacun d'un exercice préparatoire : op. 84 / par Charles Dancla."
+    assert len(df) == 2000
+
+    assert df["pod_record_id"].iloc[0] == "stanford:a1"
+    assert df["F245"].iloc[0] == "Symphony, op. 38"
+
+    assert df["pod_record_id"].iloc[1] == "stanford:a10"
+    assert df["F245"].iloc[1] == "Panisci fistula; tre preludi per tre flauti."

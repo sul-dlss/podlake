@@ -5,7 +5,7 @@ import boto3
 import moto
 import pytest
 
-from podbucket.storage import Storage
+from podlake.storage import Storage
 
 test_bucket_name = "test-bucket"
 
