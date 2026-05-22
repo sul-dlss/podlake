@@ -3,6 +3,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pymarc
+from goldrush import goldrush
 from lxml.etree import QName, _Element as Element, tostring
 from marctable import to_parquet, Column, ColumnSpec
 from marctable.marc import MARC
@@ -34,16 +35,18 @@ def oai_to_parquet(set_name: str, parquet_path: Path, limit=None, on_record=None
 def _record_iterator(
     set_id: str, limit: int | None = None, on_record=None
 ) -> Iterator[pymarc.Record]:
+    # TODO: use on disk dictionary?
     seen = set()
     for count, oai_record in enumerate(oai.list_records(set_id)):
         if limit is not None and count >= limit:
             break
 
         rec_id = oai_record.header.identifier
-        logging.debug(f"found oai record {count} with ID {rec_id}")
+        logger.debug(f"found oai record {count} with ID {rec_id}")
 
         if rec_id in seen:
-            logging.warning(f"already saw oai record! {rec_id}")
+            logger.info(f"skipping previous version of oai record {rec_id}")
+            continue
         else:
             seen.add(rec_id)
 
@@ -63,7 +66,7 @@ def _oai_to_marc_record(el: Element) -> pymarc.Record | None:
     record = pymarc.Record()
     marc_el = el.find(".//marc:record", namespaces=oai.XML_NS)
     if marc_el is None:
-        logging.warning(f"No MARC XML record found in XML: {tostring(el)}")
+        logger.warn(f"No MARC XML record found in XML: {tostring(el)}")
         return None
 
     for child in marc_el:
@@ -93,7 +96,10 @@ def _make_columns(set_name: str) -> list[ColumnSpec]:
     def _make_id(rec):
         return f"{set_name}:{rec['001'].data.strip()}"
 
-    rules: list[ColumnSpec] = [Column("pod_record_id", _make_id)]
+    rules: list[ColumnSpec] = [
+        Column("pod_record_id", _make_id),
+        Column("goldrush_key", goldrush),
+    ]
 
     for field in marc_schema.fields:
         rules.append(field.tag)

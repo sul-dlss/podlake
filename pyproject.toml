@@ -13,6 +13,7 @@ dependencies = [
   "boto3>=1.38.24",
   "sickle>=0.7.0",
   "tqdm>=4.0.0",
+  "goldrush>=0.0.1",
 ]
 
 [dependency-groups]
