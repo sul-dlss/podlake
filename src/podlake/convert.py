@@ -66,7 +66,7 @@ def _oai_to_marc_record(el: Element) -> pymarc.Record | None:
     record = pymarc.Record()
     marc_el = el.find(".//marc:record", namespaces=oai.XML_NS)
     if marc_el is None:
-        logger.warn(f"No MARC XML record found in XML: {tostring(el)}")
+        logger.warning(f"No MARC XML record found in XML: {tostring(el)}")
         return None
 
     for child in marc_el:
