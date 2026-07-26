@@ -4,8 +4,9 @@ from pathlib import Path
 
 import pymarc
 from goldrush import goldrush
-from lxml.etree import QName, _Element as Element, tostring
-from marctable import to_parquet, Column, ColumnSpec
+from lxml.etree import QName, tostring
+from lxml.etree import _Element as Element
+from marctable import Column, ColumnSpec, to_parquet
 from marctable.marc import MARC
 
 from podlake import oai
@@ -22,7 +23,7 @@ def oai_to_parquet(set_name: str, parquet_path: Path, limit=None, on_record=None
     """
     set_ = oai.get_set(set_name)
     if set_ is None:
-        raise Exception("Unknown pod set name {name}")
+        raise ValueError(f"Unknown pod set name {set_name}")
     set_id = set_.setSpec  # ty: ignore[unresolved-attribute]
 
     columns = _make_columns(set_name)
@@ -75,16 +76,32 @@ def _oai_to_marc_record(el: Element) -> pymarc.Record | None:
         if local == "leader":
             record.leader = pymarc.Leader(child.text or "")
         elif local == "controlfield":
-            field = pymarc.Field(child.get("tag"))
+            tag = child.get("tag")
+            if tag is None:
+                logger.warning(
+                    f"Skipping controlfield without a tag: {tostring(child)}"
+                )
+                continue
+            field = pymarc.Field(tag)
             field.data = child.text or ""
             record.add_field(field)
         elif local == "datafield":
+            tag = child.get("tag")
+            if tag is None:
+                logger.warning(f"Skipping datafield without a tag: {tostring(child)}")
+                continue
             field = pymarc.Field(
-                child.get("tag"),
+                tag,
                 pymarc.Indicators(child.get("ind1", " "), child.get("ind2", " ")),
             )
             for subfield in child:
-                field.add_subfield(subfield.get("code"), subfield.text or "")
+                code = subfield.get("code")
+                if code is None:
+                    logger.warning(
+                        f"Skipping subfield without a code: {tostring(subfield)}"
+                    )
+                    continue
+                field.add_subfield(code, subfield.text or "")
             record.add_field(field)
 
     return record

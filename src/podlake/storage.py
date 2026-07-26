@@ -25,7 +25,7 @@ class Storage:
             if e.response["Error"]["Code"] == "NoSuchKey":
                 return False
             else:
-                raise e
+                raise
 
     def save_file(self, path: Path) -> None:
         key = self._key(path)

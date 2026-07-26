@@ -1,16 +1,16 @@
 import os
 import threading
 from pathlib import Path
+from typing import Annotated
 
 import typer
 from rich import print
 from tqdm import tqdm
 from tqdm.contrib.concurrent import thread_map
-from typing_extensions import Annotated
 
 from podlake.config import get_config
-from podlake.oai import list_sets, get_set
 from podlake.convert import oai_to_parquet
+from podlake.oai import get_set, list_sets
 
 app = typer.Typer()
 
