@@ -1,4 +1,3 @@
-import io
 import os
 
 import boto3
@@ -19,47 +18,54 @@ def aws_credentials():
 
 
 @pytest.fixture
-def sts(aws_credentials):
-    with moto.mock_aws():
-        yield boto3.client("sts")
-
-
-@pytest.fixture
 def s3(aws_credentials):
     with moto.mock_aws():
         yield boto3.client("s3")
 
 
 @pytest.fixture
-def test_bucket(s3, sts):
+def test_bucket(s3):
     s3.create_bucket(Bucket=test_bucket_name)
-
     yield
-
-    # clear all the objects from the bucket and remove the bucket
     boto3.resource("s3").Bucket(test_bucket_name).objects.all().delete()
-    s3.delete_bucket(Bucket="test-bucket")
+    s3.delete_bucket(Bucket=test_bucket_name)
 
 
 def test_upload_file(tmp_path, test_bucket, s3):
-    # create a test file
-    test_file = tmp_path / "stanford-2025-05-26-delta-marcxml.parquet"
+    catalog = tmp_path / "podlake.ducklake"
+    catalog.write_bytes(b"catalog")
 
-    # create our storage object pointed at the bucket
+    storage = Storage(f"s3://{test_bucket_name}/pod")
+    storage.upload_file(catalog, "podlake.ducklake")
+
+    obj = s3.get_object(Bucket=test_bucket_name, Key="pod/podlake.ducklake")
+    assert obj["Body"].read() == b"catalog"
+
+
+def test_sync_dir_preserves_structure(tmp_path, test_bucket, s3):
+    records = tmp_path / "lake-data" / "main" / "records"
+    records.mkdir(parents=True)
+    (records / "a.parquet").write_bytes(b"A")
+    (tmp_path / "lake-data" / "top.txt").write_bytes(b"T")
+
+    storage = Storage(f"s3://{test_bucket_name}/pod")
+    count = storage.sync_dir(tmp_path / "lake-data", "lake-data")
+
+    assert count == 2
+    keys = sorted(
+        o["Key"] for o in s3.list_objects_v2(Bucket=test_bucket_name)["Contents"]
+    )
+    assert keys == [
+        "pod/lake-data/main/records/a.parquet",
+        "pod/lake-data/top.txt",
+    ]
+
+
+def test_sync_dir_missing_directory_is_noop(tmp_path, test_bucket):
     storage = Storage(f"s3://{test_bucket_name}")
+    assert storage.sync_dir(tmp_path / "does-not-exist") == 0
 
-    assert storage.has_file(test_file) is False, "file isn't in the bucket"
 
-    # write some data to the file and save it to storage
-    test_file.open("w").write("000")
-    storage.save_file(test_file)
-
-    assert storage.has_file(test_file) is True, "file was uploaded to bucket"
-
-    # ensure that the file was written where we expect it to be
-    bucket = boto3.resource("s3").Bucket(test_bucket_name)
-    key = f"org=stanford/{test_file.name}"
-    fh = io.BytesIO()
-    bucket.download_fileobj(key, fh)
-    fh.seek(0)
-    assert fh.read() == b"000", "content was written to the file"
+def test_bad_uri_rejected():
+    with pytest.raises(ValueError):
+        Storage("not-an-s3-url")

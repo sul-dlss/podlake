@@ -4,39 +4,51 @@ import re
 from pathlib import Path
 
 import boto3
-from botocore.exceptions import ClientError
 from mypy_boto3_s3.service_resource import Bucket, S3ServiceResource
 
 logger = logging.getLogger(__name__)
 
 
 class Storage:
+    """
+    A small helper for uploading files to an S3 bucket, used to publish a
+    file-catalog DuckLake (the catalog file plus its Parquet data files) to a
+    bucket that read-only consumers can attach to.
+    """
+
     def __init__(self, bucket_uri: str):
-        self.bucket_name = re.sub(r"^s3://", "", bucket_uri)
+        # accept s3://bucket or s3://bucket/some/prefix
+        match = re.match(r"^s3://([^/]+)/?(.*)$", bucket_uri)
+        if match is None:
+            raise ValueError(f"expected an s3:// URL, got {bucket_uri!r}")
+        self.bucket_name = match.group(1)
+        self.prefix = match.group(2).strip("/")
         self.bucket = self._get_bucket()
 
-    def has_file(self, path: Path) -> bool:
-        key = self._key(path)
+    def upload_file(self, path: Path, key: str) -> None:
+        full_key = self._full_key(key)
+        logger.info(f"uploading {path} to s3://{self.bucket_name}/{full_key}")
+        self.bucket.upload_file(str(path), full_key)
 
-        try:
-            self.bucket.Object(key).get()
-            return True
-        except ClientError as e:
-            if e.response["Error"]["Code"] == "NoSuchKey":
-                return False
-            else:
-                raise
+    def sync_dir(self, local_dir: Path, key_prefix: str = "") -> int:
+        """
+        Upload every file under local_dir to the bucket, preserving the
+        directory structure under key_prefix. Returns the number of files
+        uploaded.
+        """
+        if not local_dir.is_dir():
+            return 0
+        count = 0
+        for path in sorted(local_dir.rglob("*")):
+            if path.is_file():
+                rel = path.relative_to(local_dir).as_posix()
+                key = f"{key_prefix}/{rel}" if key_prefix else rel
+                self.upload_file(path, key)
+                count += 1
+        return count
 
-    def save_file(self, path: Path) -> None:
-        key = self._key(path)
-        logger.info(f"uploading {path} to {key}")
-        self.bucket.upload_file(str(path), key)
-
-    def _key(self, path: Path) -> str:
-        # determining the org like this depends on it being the prefix
-        # e.g. penn-2025-05-21-delta-marcxml.xml.gz
-        org = path.name.split("-")[0]
-        return f"org={org}/{path.name}"
+    def _full_key(self, key: str) -> str:
+        return f"{self.prefix}/{key}" if self.prefix else key
 
     def _get_bucket(self) -> Bucket:
         s3 = self._get_s3()
@@ -56,9 +68,7 @@ class Storage:
 
         if role:
             sts_client = boto3.client("sts")
-            response = sts_client.assume_role(
-                RoleArn=role, RoleSessionName="speech-to-text"
-            )
+            response = sts_client.assume_role(RoleArn=role, RoleSessionName="podlake")
             session = {
                 "aws_access_key_id": response["Credentials"]["AccessKeyId"],
                 "aws_secret_access_key": response["Credentials"]["SecretAccessKey"],
