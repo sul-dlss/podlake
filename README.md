@@ -4,7 +4,15 @@
 
 podlake harvests MARC XML data from [POD]'s OAI-PMH service, converts it to
 Parquet with [marctable], and loads it into a [DuckLake] lakehouse so it can be
-queried with DuckDB (and other engines like Spark, Presto, or AWS Athena).
+queried with DuckDB.
+
+DuckLake is a DuckDB-centric table format: today you query it with DuckDB (the
+`ducklake` extension). The data files are ordinary Parquet, but reading them
+directly with another tool bypasses the DuckLake catalog — its snapshots and
+merge-on-read delete files — and would return incorrect results after updates,
+so use a DuckLake-aware client. Multi-engine access (Spark, Trino/Athena) is on
+DuckLake's roadmap but not yet practical; if you need that today, Iceberg is the
+better-supported format.
 
 The data flows in three steps:
 
