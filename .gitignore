@@ -10,3 +10,11 @@ wheels/
 .venv
 .env
 uv.lock
+
+# Harvested data and local DuckLake artifacts
+*.parquet
+lake-data/
+*.ducklake
+*.ducklake.wal
+*.ducklake.files/
+test.log

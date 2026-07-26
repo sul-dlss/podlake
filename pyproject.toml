@@ -14,6 +14,7 @@ dependencies = [
   "sickle>=0.7.0",
   "tqdm>=4.0.0",
   "goldrush>=0.0.1",
+  "duckdb>=1.5.2",
 ]
 
 [dependency-groups]
@@ -28,7 +29,7 @@ dev = [
 ]
 
 [project.urls]
-homepage = "https://github.com/sul-dlss-labs/marctable"
+homepage = "https://github.com/sul-dlss/podlake"
 
 [project.scripts]
 podlake = "podlake:app"
