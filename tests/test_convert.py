@@ -14,14 +14,14 @@ def test_convert(tmp_path):
     assert df["pod_record_id"].iloc[0] == "stanford:a1"
     assert (
         df["goldrush_key"].iloc[0]
-        == "symphonyop38__________________________________________________________1967196____roberc_______________________________________________________schum_______________p"
+        == "symphonyop38________________________________________________________________________________________1967_______roberc________________________________________schum________________v03182026p"
     )
     assert df["F245"].iloc[0] == "Symphony, op. 38"
 
     assert df["pod_record_id"].iloc[1] == "stanford:a10"
     assert (
         df["goldrush_key"].iloc[1]
-        == "paniscifistulatrepreludipertreflauti__________________________________19737___________c_______________________________________________________novak_______________p"
+        == "paniscifistulatrepreludipertreflauti________________________________________________________________1973_______c________________________________________novak________________v03182026p"
     )
 
     assert df["F245"].iloc[1] == "Panisci fistula; tre preludi per tre flauti."
