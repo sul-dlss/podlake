@@ -3,8 +3,10 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pymarc
-from lxml.etree import QName, _Element as Element, tostring
-from marctable import to_parquet, Column, ColumnSpec
+from goldrush import goldrush
+from lxml.etree import QName, tostring
+from lxml.etree import _Element as Element
+from marctable import Column, ColumnSpec, to_parquet
 from marctable.marc import MARC
 
 from podlake import oai
@@ -21,7 +23,7 @@ def oai_to_parquet(set_name: str, parquet_path: Path, limit=None, on_record=None
     """
     set_ = oai.get_set(set_name)
     if set_ is None:
-        raise Exception("Unknown pod set name {name}")
+        raise ValueError(f"Unknown pod set name {set_name}")
     set_id = set_.setSpec  # ty: ignore[unresolved-attribute]
 
     columns = _make_columns(set_name)
@@ -34,16 +36,18 @@ def oai_to_parquet(set_name: str, parquet_path: Path, limit=None, on_record=None
 def _record_iterator(
     set_id: str, limit: int | None = None, on_record=None
 ) -> Iterator[pymarc.Record]:
+    # TODO: use on disk dictionary?
     seen = set()
     for count, oai_record in enumerate(oai.list_records(set_id)):
         if limit is not None and count >= limit:
             break
 
         rec_id = oai_record.header.identifier
-        logging.debug(f"found oai record {count} with ID {rec_id}")
+        logger.debug(f"found oai record {count} with ID {rec_id}")
 
         if rec_id in seen:
-            logging.warning(f"already saw oai record! {rec_id}")
+            logger.info(f"skipping previous version of oai record {rec_id}")
+            continue
         else:
             seen.add(rec_id)
 
@@ -63,7 +67,7 @@ def _oai_to_marc_record(el: Element) -> pymarc.Record | None:
     record = pymarc.Record()
     marc_el = el.find(".//marc:record", namespaces=oai.XML_NS)
     if marc_el is None:
-        logging.warning(f"No MARC XML record found in XML: {tostring(el)}")
+        logger.warning(f"No MARC XML record found in XML: {tostring(el)}")
         return None
 
     for child in marc_el:
@@ -72,16 +76,32 @@ def _oai_to_marc_record(el: Element) -> pymarc.Record | None:
         if local == "leader":
             record.leader = pymarc.Leader(child.text or "")
         elif local == "controlfield":
-            field = pymarc.Field(child.get("tag"))
+            tag = child.get("tag")
+            if tag is None:
+                logger.warning(
+                    f"Skipping controlfield without a tag: {tostring(child)}"
+                )
+                continue
+            field = pymarc.Field(tag)
             field.data = child.text or ""
             record.add_field(field)
         elif local == "datafield":
+            tag = child.get("tag")
+            if tag is None:
+                logger.warning(f"Skipping datafield without a tag: {tostring(child)}")
+                continue
             field = pymarc.Field(
-                child.get("tag"),
+                tag,
                 pymarc.Indicators(child.get("ind1", " "), child.get("ind2", " ")),
             )
             for subfield in child:
-                field.add_subfield(subfield.get("code"), subfield.text or "")
+                code = subfield.get("code")
+                if code is None:
+                    logger.warning(
+                        f"Skipping subfield without a code: {tostring(subfield)}"
+                    )
+                    continue
+                field.add_subfield(code, subfield.text or "")
             record.add_field(field)
 
     return record
@@ -93,7 +113,10 @@ def _make_columns(set_name: str) -> list[ColumnSpec]:
     def _make_id(rec):
         return f"{set_name}:{rec['001'].data.strip()}"
 
-    rules: list[ColumnSpec] = [Column("pod_record_id", _make_id)]
+    rules: list[ColumnSpec] = [
+        Column("pod_record_id", _make_id),
+        Column("goldrush_key", goldrush),
+    ]
 
     for field in marc_schema.fields:
         rules.append(field.tag)

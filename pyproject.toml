@@ -1,7 +1,7 @@
 [project]
 name = "podlake"
 version = "0.1.0"
-description = "Add your description here"
+description = "Analyze POD MARC data with DuckLake"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
@@ -13,6 +13,7 @@ dependencies = [
   "boto3>=1.38.24",
   "sickle>=0.7.0",
   "tqdm>=4.0.0",
+  "goldrush>=0.0.1",
 ]
 
 [dependency-groups]

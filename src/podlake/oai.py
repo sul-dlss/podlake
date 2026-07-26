@@ -1,6 +1,5 @@
 import os
 from collections.abc import Iterator
-from typing import Optional
 
 from sickle import Sickle
 from sickle.models import Record, Set
@@ -23,7 +22,7 @@ def get_set(name: str) -> Set | None:
     return None
 
 
-def list_records(set_id: str, from_: Optional[str] = None) -> Iterator[Record]:
+def list_records(set_id: str, from_: str | None = None) -> Iterator[Record]:
     oai = Sickle("https://pod.stanford.edu/oai", headers=_headers())
 
     # we are going to get marc21 records for the set
@@ -42,5 +41,5 @@ def list_records(set_id: str, from_: Optional[str] = None) -> Iterator[Record]:
 def _headers() -> dict[str, str]:
     token = os.environ.get("PODBUCKET_POD_TOKEN")
     if token is None:
-        raise Exception("PODBUCKET_POD_TOKEN env var isn't set!")
+        raise RuntimeError("PODBUCKET_POD_TOKEN env var isn't set!")
     return {"Authorization": f"Bearer {token}"}
