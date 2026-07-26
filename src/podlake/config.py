@@ -42,15 +42,16 @@ class Config:
 
     def attach_sql(self, read_only: bool = False) -> str:
         """
-        Build the ATTACH statement for this profile's DuckLake catalog.
+        Build the ATTACH statement for this profile's DuckLake catalog. The
+        catalog URI (which may embed a Postgres password) and data path can't be
+        passed as bind parameters, so they are inlined as single-quoted SQL
+        literals with embedded quotes escaped.
         """
-        options = [f"DATA_PATH '{self.data_path}'"]
+        options = [f"DATA_PATH '{_sql_literal(self.data_path)}'"]
         if read_only:
             options.append("READ_ONLY")
-        return (
-            f"ATTACH 'ducklake:{self.catalog_uri}' AS {LAKE_ALIAS} "
-            f"({', '.join(options)})"
-        )
+        target = _sql_literal(f"ducklake:{self.catalog_uri}")
+        return f"ATTACH '{target}' AS {LAKE_ALIAS} ({', '.join(options)})"
 
     def describe(self) -> dict[str, str]:
         """
@@ -153,3 +154,8 @@ def _mask(secret: str) -> str:
     if not secret:
         return ""
     return "*" * len(secret)
+
+
+def _sql_literal(value: str) -> str:
+    """Escape a value for use inside a single-quoted SQL string literal."""
+    return value.replace("'", "''")

@@ -49,8 +49,10 @@ def ensure_schema(con: duckdb.DuckDBPyConnection, columns: list[str]) -> None:
     if existing:
         return
 
-    col_defs = ", ".join(f'"{name}" VARCHAR' for name in columns)
-    con.execute(f'CREATE TABLE {RECORDS_TABLE} ("org" VARCHAR, {col_defs})')
+    col_defs = ", ".join(f"{_quote_ident(name)} VARCHAR" for name in columns)
+    con.execute(
+        f"CREATE TABLE {RECORDS_TABLE} ({_quote_ident('org')} VARCHAR, {col_defs})"
+    )
     con.execute(f"ALTER TABLE {RECORDS_TABLE} SET PARTITIONED BY (org)")
     logger.info("created %s table partitioned by org", RECORDS_TABLE)
 
@@ -70,12 +72,7 @@ def load_parquet(con: duckdb.DuckDBPyConnection, parquet_path: Path, org: str) -
     con.execute("BEGIN TRANSACTION")
     try:
         con.execute(f"DELETE FROM {RECORDS_TABLE} WHERE org = ?", [org])
-        select_cols = ", ".join(f'"{name}"' for name in columns)
-        con.execute(
-            f"INSERT INTO {RECORDS_TABLE} "
-            f"SELECT ? AS org, {select_cols} FROM read_parquet(?)",
-            [org, str(parquet_path)],
-        )
+        _insert_parquet(con, org, parquet_path, columns)
         con.execute("COMMIT")
     except Exception:
         con.execute("ROLLBACK")
@@ -148,12 +145,7 @@ def apply_update(
             "(SELECT pod_record_id FROM read_parquet(?))",
             [str(delta_parquet)],
         )
-        select_cols = ", ".join(f'"{name}"' for name in columns)
-        con.execute(
-            f"INSERT INTO {RECORDS_TABLE} "
-            f"SELECT ? AS org, {select_cols} FROM read_parquet(?)",
-            [org, str(delta_parquet)],
-        )
+        _insert_parquet(con, org, delta_parquet, columns)
         changed = con.execute(
             "SELECT count(*) FROM read_parquet(?)", [str(delta_parquet)]
         ).fetchone()
@@ -168,8 +160,7 @@ def apply_update(
             )
             deleted_count = len(deleted_ids)
 
-        con.execute(f"DELETE FROM {STATE_TABLE} WHERE org = ?", [org])
-        con.execute(f"INSERT INTO {STATE_TABLE} VALUES (?, ?)", [org, harvest_date])
+        set_last_harvest(con, org, harvest_date)
         con.execute("COMMIT")
     except Exception:
         con.execute("ROLLBACK")
@@ -208,6 +199,32 @@ def publish(config: Config, dest_uri: str) -> tuple[str, str, int]:
 
     logger.info("published %s + %s data files to %s", catalog_key, data_files, dest_uri)
     return catalog_key, data_prefix, data_files + 1
+
+
+def _insert_parquet(
+    con: duckdb.DuckDBPyConnection,
+    org: str,
+    parquet_path: Path,
+    columns: list[str],
+) -> None:
+    """
+    Insert every row of a Parquet file into `records`, prepending the org
+    partition column. Shared by the full-load and incremental-update paths.
+    """
+    select_cols = ", ".join(_quote_ident(name) for name in columns)
+    con.execute(
+        f"INSERT INTO {RECORDS_TABLE} "
+        f"SELECT ? AS org, {select_cols} FROM read_parquet(?)",
+        [org, str(parquet_path)],
+    )
+
+
+def _quote_ident(name: str) -> str:
+    # Column names come from the Parquet schema (marctable's fixed field/subfield
+    # set), so they are trusted, but quote-escape defensively since identifiers
+    # can't be passed as bind parameters.
+    escaped = name.replace('"', '""')
+    return f'"{escaped}"'
 
 
 def _parquet_columns(con: duckdb.DuckDBPyConnection, parquet_path: Path) -> list[str]:
