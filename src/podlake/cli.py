@@ -79,6 +79,13 @@ def convert(
         Path, typer.Argument(help="Path to write Parquet file", dir_okay=False)
     ],
     limit: Annotated[int | None, typer.Option(help="Limit number of records")] = None,
+    batch_size: Annotated[
+        int,
+        typer.Option(
+            help="Records buffered per Parquet row group. Lower it to reduce "
+            "peak memory on constrained machines."
+        ),
+    ] = 100_000,
 ):
     """
     Harvest records for the given organization name: e.g. "stanford" and write
@@ -99,6 +106,7 @@ def convert(
             output_path,
             limit,
             on_record=lambda _: progress.update(1),
+            batch_size=batch_size,
         )
 
 
@@ -113,6 +121,13 @@ def convert_all(
     workers: Annotated[
         int, typer.Option(help="Number of worker processes to use in parallel")
     ] = 1,
+    batch_size: Annotated[
+        int,
+        typer.Option(
+            help="Records buffered per Parquet row group. Lower it to reduce "
+            "peak memory on constrained machines."
+        ),
+    ] = 100_000,
 ):
     """
     Harvest all records and write them organization specific parquet files in
@@ -124,7 +139,7 @@ def convert_all(
         output_dir.mkdir(parents=True)
 
     sets = list_sets()
-    set_args = [(s.contributor, output_dir) for s in sets]  # ty: ignore[unresolved-attribute]
+    set_args = [(s.contributor, output_dir, batch_size) for s in sets]  # ty: ignore[unresolved-attribute]
 
     try:
         thread_map(_convert, set_args, max_workers=workers, desc="converting sets")
@@ -151,12 +166,17 @@ def _thread_position():
 
 
 def _convert(set_args):
-    set_name, output_dir = set_args
+    set_name, output_dir, batch_size = set_args
     parquet_path = output_dir / f"{set_name}.parquet"
     with tqdm(
         desc=set_name, unit=" records", smoothing=0.01, position=_thread_position()
     ) as progress:
-        oai_to_parquet(set_name, parquet_path, on_record=lambda _: progress.update(1))
+        oai_to_parquet(
+            set_name,
+            parquet_path,
+            on_record=lambda _: progress.update(1),
+            batch_size=batch_size,
+        )
 
 
 @app.command()

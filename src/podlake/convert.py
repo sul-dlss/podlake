@@ -22,6 +22,7 @@ def oai_to_parquet(
     on_record=None,
     from_: str | None = None,
     deleted: list[str] | None = None,
+    batch_size: int = 100_000,
 ):
     """
     Pass in the name of the collection to harvest, a path to a Parquet file
@@ -33,6 +34,11 @@ def oai_to_parquet(
     after that date, which is how incremental updates are performed. When
     harvesting a delta, pass a list as `deleted` to collect the pod_record_ids
     of records POD reports as deleted, so they can be removed downstream.
+
+    batch_size is the number of records buffered in memory per Parquet row
+    group. Larger values make bigger row groups (marginally better for querying
+    the file directly) at the cost of substantially higher peak memory, because
+    podlake's MARC schema is very wide. Lower it on memory-constrained machines.
     """
     set_ = oai.get_set(set_name)
     if set_ is None:
@@ -48,7 +54,7 @@ def oai_to_parquet(
         from_=from_,
         deleted=deleted,
     )
-    to_parquet(records, parquet_path.open("wb"), columns=columns, batch_size=100_000)
+    to_parquet(records, parquet_path.open("wb"), columns=columns, batch_size=batch_size)
 
     return parquet_path
 

@@ -101,6 +101,14 @@ runs one worker at a time; use `--workers` to harvest concurrently:
 $ uvx podlake convert-all ./output/ --workers 4
 ```
 
+Harvesting buffers records in memory per Parquet row group. Because the MARC
+schema is very wide, the default (`--batch-size 100000`) can use several GB of
+RAM for a large provider; lower it on memory-constrained machines:
+
+```
+$ uvx podlake convert stanford stanford.parquet --batch-size 10000
+```
+
 ## Build the lake
 
 Load the Parquet files into the DuckLake. Point `load` at a directory to load
