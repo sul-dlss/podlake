@@ -148,6 +148,81 @@ def test_apply_resource_upsert_and_delete(tmp_path):
     con.close()
 
 
+def test_apply_resource_empty_delta(tmp_path):
+    con = lake.connect(read_only=False, config=_dev_config(tmp_path))
+    srpq, smpq = _write_org(
+        tmp_path, "stanford", [_record("stanford", "a1", "Symphony", "k1")]
+    )
+    lake.load_pair(con, "stanford", srpq, smpq)
+
+    # an empty delta (0 records) is a no-op that still advances the cursor
+    erpq, empq = _write_org(tmp_path, "empty", [])
+    ts = datetime(2026, 3, 1, tzinfo=UTC)
+    changed, deleted = lake.apply_resource(con, "stanford", "delta", (erpq, empq), ts)
+    assert (changed, deleted) == (0, 0)
+    assert con.execute("SELECT count(*) FROM record_meta").fetchone() == (1,)
+    assert lake.get_cursor(con, "stanford") == ts
+    con.close()
+
+
+def test_eav_query_shapes(tmp_path):
+    con = lake.connect(read_only=False, config=_dev_config(tmp_path))
+    rows = [
+        ("stanford", "stanford:a1", "LDR", 0, None, None, None, None, "00000nam"),
+        ("stanford", "stanford:a1", "001", 1, None, None, None, None, "a1"),
+        ("stanford", "stanford:a1", "245", 2, "1", "0", "a", 0, "Symphony"),
+        ("stanford", "stanford:a1", "245", 2, "1", "0", "b", 1, "in D"),
+        ("stanford", "stanford:a1", "100", 3, "1", " ", "a", 0, "Beethoven"),
+        ("stanford", "stanford:a1", "650", 4, " ", "0", "a", 0, "Music"),
+        ("stanford", "stanford:a1", "650", 5, " ", "0", "a", 0, "History"),
+        ("stanford", "stanford:a2", "LDR", 0, None, None, None, None, "00000nam"),
+        ("stanford", "stanford:a2", "001", 1, None, None, None, None, "a2"),
+        ("stanford", "stanford:a2", "245", 2, "1", "0", "a", 0, "Sonata"),
+        ("stanford", "stanford:a2", "100", 3, "1", " ", "a", 0, "Mozart"),
+    ]
+    rpq = tmp_path / "s.records.parquet"
+    mpq = tmp_path / "s.meta.parquet"
+    _records_parquet(rpq, rows)
+    _meta_parquet(
+        mpq, [("stanford", "stanford:a1", "k1"), ("stanford", "stanford:a2", "k2")]
+    )
+    lake.load_pair(con, "stanford", rpq, mpq)
+
+    # whole 245 field via string_agg (subfields joined in subfield order)
+    whole = con.execute(
+        "SELECT string_agg(value, ' ' ORDER BY subfield_seq) FROM records "
+        "WHERE pod_record_id='stanford:a1' AND field_tag='245'"
+    ).fetchone()
+    assert whole == ("Symphony in D",)
+
+    # self-join: title <-> author
+    sj = con.execute(
+        "SELECT t.value, a.value FROM records t JOIN records a USING (pod_record_id) "
+        "WHERE t.field_tag='245' AND t.subfield_code='a' "
+        "AND a.field_tag='100' AND a.subfield_code='a' "
+        "AND t.pod_record_id='stanford:a1'"
+    ).fetchone()
+    assert sj == ("Symphony", "Beethoven")
+
+    # FILTER-agg pivot: title per record
+    pivot = dict(
+        con.execute(
+            "SELECT pod_record_id, "
+            "max(value) FILTER (WHERE field_tag='245' AND subfield_code='a') "
+            "FROM records GROUP BY pod_record_id"
+        ).fetchall()
+    )
+    assert pivot == {"stanford:a1": "Symphony", "stanford:a2": "Sonata"}
+
+    # repeated 650 preserved as two rows with distinct field_seq
+    counts = con.execute(
+        "SELECT count(*), count(DISTINCT field_seq) FROM records "
+        "WHERE pod_record_id='stanford:a1' AND field_tag='650'"
+    ).fetchone()
+    assert counts == (2, 2)
+    con.close()
+
+
 def test_get_cursor_absent(tmp_path):
     con = lake.connect(read_only=False, config=_dev_config(tmp_path))
     assert lake.get_cursor(con, "stanford") is None

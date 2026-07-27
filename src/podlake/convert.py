@@ -98,7 +98,9 @@ def dump_to_parquet(
 def _flush(writer: pq.ParquetWriter, schema: pa.Schema, buf: dict[str, list]) -> None:
     if not buf[schema.names[0]]:
         return
-    writer.write_table(pa.table({name: buf[name] for name in schema.names}, schema))
+    writer.write_table(
+        pa.table({name: buf[name] for name in schema.names}, schema=schema)
+    )
     for name in schema.names:
         buf[name].clear()
 

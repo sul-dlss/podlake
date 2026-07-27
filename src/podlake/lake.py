@@ -128,19 +128,6 @@ def get_cursor(con: duckdb.DuckDBPyConnection, org: str) -> datetime | None:
     return row[0].replace(tzinfo=UTC)
 
 
-def set_cursor(
-    con: duckdb.DuckDBPyConnection, org: str, last_modified: datetime
-) -> None:
-    ensure_state_table(con)
-    con.execute("BEGIN TRANSACTION")
-    try:
-        _set_cursor(con, org, last_modified)
-        con.execute("COMMIT")
-    except Exception:
-        con.execute("ROLLBACK")
-        raise
-
-
 def _set_cursor(
     con: duckdb.DuckDBPyConnection, org: str, last_modified: datetime
 ) -> None:

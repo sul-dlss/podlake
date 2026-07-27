@@ -78,6 +78,56 @@ def test_dump_to_parquet_emits_eav_and_meta(tmp_path):
     assert all(m[1] for m in meta), "goldrush_key populated"
 
 
+def test_repeated_field_preserves_order(tmp_path):
+    # a record with two 650 fields — repeats must land in distinct field_seq,
+    # in source order, so the record reconstructs exactly
+    rec = (
+        '<record xmlns="http://www.loc.gov/MARC21/slim">'
+        f"<leader>{LEADER}</leader>"
+        '<controlfield tag="001">r1</controlfield>'
+        '<datafield tag="650" ind1=" " ind2="0">'
+        '<subfield code="a">History</subfield></datafield>'
+        '<datafield tag="650" ind1=" " ind2="0">'
+        '<subfield code="a">Music</subfield></datafield>'
+        "</record>"
+    )
+    gz = tmp_path / "d.xml.gz"
+    with gzip.open(gz, "wb") as fh:
+        fh.write(
+            f'<collection xmlns="http://www.loc.gov/MARC21/slim">{rec}</collection>'.encode()
+        )
+    records_out, meta_out = tmp_path / "r.parquet", tmp_path / "m.parquet"
+    dump_to_parquet("brown", gz, records_out, meta_out)
+
+    rows = (
+        duckdb.connect()
+        .execute(
+            f"SELECT field_seq, subfield_code, value FROM read_parquet('{records_out}') "
+            "WHERE field_tag='650' ORDER BY field_seq, subfield_seq"
+        )
+        .fetchall()
+    )
+    # LDR=0, 001=1, so the two 650s are field_seq 2 and 3, in order
+    assert rows == [(2, "a", "History"), (3, "a", "Music")]
+
+
+def test_dump_to_parquet_empty_dump(tmp_path):
+    gz = tmp_path / "empty.xml.gz"
+    with gzip.open(gz, "wb") as fh:
+        fh.write(b'<collection xmlns="http://www.loc.gov/MARC21/slim"></collection>')
+    records_out, meta_out = tmp_path / "r.parquet", tmp_path / "m.parquet"
+
+    dump_to_parquet("brown", gz, records_out, meta_out)
+
+    con = duckdb.connect()
+    assert con.execute(
+        f"SELECT count(*) FROM read_parquet('{records_out}')"
+    ).fetchone() == (0,)
+    assert con.execute(
+        f"SELECT count(*) FROM read_parquet('{meta_out}')"
+    ).fetchone() == (0,)
+
+
 def test_record_to_rows_skips_record_without_001():
     xml = (
         '<record xmlns="http://www.loc.gov/MARC21/slim">'
