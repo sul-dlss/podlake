@@ -22,6 +22,22 @@ def test_deleted_pod_record_id():
     assert _deleted_pod_record_id("stanford", identifier) == "stanford:a1"
 
 
+def test_oai_to_parquet_passes_batch_size(monkeypatch, tmp_path):
+    class _FakeSet:
+        setSpec = "503"
+
+    captured = {}
+
+    def fake_to_parquet(records, output, columns=None, batch_size=None):
+        captured["batch_size"] = batch_size
+
+    monkeypatch.setattr(convert.oai, "get_set", lambda name: _FakeSet())
+    monkeypatch.setattr(convert, "to_parquet", fake_to_parquet)
+
+    convert.oai_to_parquet("stanford", tmp_path / "out.parquet", batch_size=1234)
+    assert captured["batch_size"] == 1234
+
+
 def test_record_iterator_collects_deletions_and_skips_them(monkeypatch):
     records = [
         _FakeRecord("oai:pod.stanford.edu:stanford:a1", deleted=False, xml="rec-a1"),
