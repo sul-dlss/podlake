@@ -1,5 +1,5 @@
 import logging
-from datetime import date
+from datetime import UTC, datetime
 from pathlib import Path
 
 import duckdb
@@ -88,86 +88,124 @@ def load_parquet(con: duckdb.DuckDBPyConnection, parquet_path: Path, org: str) -
 
 def ensure_state_table(con: duckdb.DuckDBPyConnection) -> None:
     """
-    Create the `harvest_state` table if needed. It records the last date each
-    org was harvested through, so the next update can pass it as the OAI `from`.
+    Create the `harvest_state` table if needed. It records the lastmod of the
+    last ResourceSync resource processed per org (the sync cursor), so the next
+    sync only processes newer resources.
     """
+    # Stored as a naive UTC TIMESTAMP (not TIMESTAMPTZ, which would make DuckDB
+    # require pytz on read); UTC is re-attached in get_cursor.
     con.execute(
-        f"CREATE TABLE IF NOT EXISTS {STATE_TABLE} (org VARCHAR, last_harvest DATE)"
+        f"CREATE TABLE IF NOT EXISTS {STATE_TABLE} "
+        "(org VARCHAR, last_modified TIMESTAMP)"
     )
 
 
-def get_last_harvest(con: duckdb.DuckDBPyConnection, org: str) -> date | None:
+def get_cursor(con: duckdb.DuckDBPyConnection, org: str) -> datetime | None:
     """
-    Return the date this org was last harvested through, or None if it has never
-    been harvested (in which case an update should do a full harvest).
+    Return the lastmod (UTC) of the last resource processed for this org, or
+    None if it has never been synced (so the next sync starts from the full
+    dump).
     """
     ensure_state_table(con)
     row = con.execute(
-        f"SELECT last_harvest FROM {STATE_TABLE} WHERE org = ?", [org]
+        f"SELECT last_modified FROM {STATE_TABLE} WHERE org = ?", [org]
     ).fetchone()
-    return row[0] if row else None
+    if not row or row[0] is None:
+        return None
+    return row[0].replace(tzinfo=UTC)
 
 
-def set_last_harvest(
-    con: duckdb.DuckDBPyConnection, org: str, harvest_date: date
+def set_cursor(
+    con: duckdb.DuckDBPyConnection, org: str, last_modified: datetime
 ) -> None:
     ensure_state_table(con)
-    con.execute(f"DELETE FROM {STATE_TABLE} WHERE org = ?", [org])
-    con.execute(f"INSERT INTO {STATE_TABLE} VALUES (?, ?)", [org, harvest_date])
-
-
-def apply_update(
-    con: duckdb.DuckDBPyConnection,
-    org: str,
-    delta_parquet: Path,
-    deleted_ids: list[str],
-    harvest_date: date,
-) -> tuple[int, int]:
-    """
-    Apply an incremental update for one org in a single transaction (one
-    DuckLake snapshot): upsert the changed records in `delta_parquet` keyed by
-    pod_record_id, remove any `deleted_ids`, and record `harvest_date` as the
-    org's new last-harvest date. Returns (changed_count, deleted_count).
-
-    The delta Parquet has the same columns as a full harvest, so the `records`
-    table is created from it if this is the first data for the lake.
-    """
-    columns = _parquet_columns(con, delta_parquet)
-    ensure_schema(con, columns)
-    ensure_state_table(con)
-
     con.execute("BEGIN TRANSACTION")
     try:
-        # Replace changed records: delete the existing rows for the incoming
-        # pod_record_ids, then insert the new versions.
-        con.execute(
-            f"DELETE FROM {RECORDS_TABLE} WHERE pod_record_id IN "
-            "(SELECT pod_record_id FROM read_parquet(?))",
-            [str(delta_parquet)],
-        )
-        _insert_parquet(con, org, delta_parquet, columns)
-        changed = con.execute(
-            "SELECT count(*) FROM read_parquet(?)", [str(delta_parquet)]
-        ).fetchone()
-        changed_count = changed[0] if changed else 0
+        _set_cursor(con, org, last_modified)
+        con.execute("COMMIT")
+    except Exception:
+        con.execute("ROLLBACK")
+        raise
 
-        deleted_count = 0
-        if deleted_ids:
-            placeholders = ", ".join("?" for _ in deleted_ids)
+
+def _set_cursor(
+    con: duckdb.DuckDBPyConnection, org: str, last_modified: datetime
+) -> None:
+    con.execute(f"DELETE FROM {STATE_TABLE} WHERE org = ?", [org])
+    con.execute(
+        f"INSERT INTO {STATE_TABLE} VALUES (?, ?)", [org, _naive_utc(last_modified)]
+    )
+
+
+def _naive_utc(dt: datetime) -> datetime:
+    """Normalize a datetime to a naive UTC value for the TIMESTAMP column."""
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(UTC)
+    return dt.replace(tzinfo=None)
+
+
+def apply_resource(
+    con: duckdb.DuckDBPyConnection,
+    org: str,
+    kind: str,
+    payload: Path | list[str],
+    last_modified: datetime,
+) -> tuple[int, int]:
+    """
+    Apply one ResourceSync resource for an org in a single transaction (one
+    DuckLake snapshot), then advance the org's sync cursor to `last_modified`:
+
+    - "full"/"delta": `payload` is a Parquet path; upsert its records by
+      pod_record_id (delete existing ids, insert the new versions).
+    - "deletes": `payload` is a list of pod_record_ids to delete.
+
+    Returns (changed_count, deleted_count).
+    """
+    ensure_state_table(con)
+
+    changed_count = deleted_count = 0
+    con.execute("BEGIN TRANSACTION")
+    try:
+        if kind in ("full", "delta"):
+            assert isinstance(payload, Path)
+            columns = _parquet_columns(con, payload)
+            ensure_schema(con, columns)
             con.execute(
-                f"DELETE FROM {RECORDS_TABLE} WHERE pod_record_id IN ({placeholders})",
-                deleted_ids,
+                f"DELETE FROM {RECORDS_TABLE} WHERE pod_record_id IN "
+                "(SELECT pod_record_id FROM read_parquet(?))",
+                [str(payload)],
             )
-            deleted_count = len(deleted_ids)
+            _insert_parquet(con, org, payload, columns)
+            row = con.execute(
+                "SELECT count(*) FROM read_parquet(?)", [str(payload)]
+            ).fetchone()
+            changed_count = row[0] if row else 0
+        elif kind == "deletes":
+            assert isinstance(payload, list)
+            # A deletes resource can precede any data (nothing to delete yet).
+            if payload and _table_exists(con, RECORDS_TABLE):
+                placeholders = ", ".join("?" for _ in payload)
+                con.execute(
+                    f"DELETE FROM {RECORDS_TABLE} "
+                    f"WHERE pod_record_id IN ({placeholders})",
+                    payload,
+                )
+                deleted_count = len(payload)
+        else:
+            raise ValueError(f"unknown resource kind: {kind}")
 
-        set_last_harvest(con, org, harvest_date)
+        _set_cursor(con, org, last_modified)
         con.execute("COMMIT")
     except Exception:
         con.execute("ROLLBACK")
         raise
 
     logger.info(
-        "update org=%s: %s changed, %s deleted", org, changed_count, deleted_count
+        "applied %s for org=%s: %s changed, %s deleted",
+        kind,
+        org,
+        changed_count,
+        deleted_count,
     )
     return changed_count, deleted_count
 
@@ -230,6 +268,14 @@ def _quote_ident(name: str) -> str:
 def _parquet_columns(con: duckdb.DuckDBPyConnection, parquet_path: Path) -> list[str]:
     rel = con.execute("SELECT * FROM read_parquet(?) LIMIT 0", [str(parquet_path)])
     return [description[0] for description in rel.description]
+
+
+def _table_exists(con: duckdb.DuckDBPyConnection, name: str) -> bool:
+    row = con.execute(
+        "SELECT count(*) FROM information_schema.tables WHERE table_name = ?",
+        [name],
+    ).fetchone()
+    return bool(row and row[0])
 
 
 def _load_extensions(con: duckdb.DuckDBPyConnection, config: Config) -> None:

@@ -1,134 +1,82 @@
+import gzip
 import logging
 from collections.abc import Iterator
 from pathlib import Path
 
 import pymarc
 from goldrush import goldrush
+from lxml import etree
 from lxml.etree import QName, tostring
 from lxml.etree import _Element as Element
 from marctable import Column, ColumnSpec, to_parquet
 from marctable.marc import MARC
-from sickle.oaiexceptions import NoRecordsMatch
-
-from podlake import oai
 
 logger = logging.getLogger(__name__)
 
+MARC_NS = "http://www.loc.gov/MARC21/slim"
 
-def oai_to_parquet(
-    set_name: str,
+
+def dump_to_parquet(
+    org: str,
+    marcxml_path: Path,
     parquet_path: Path,
-    limit=None,
-    on_record=None,
-    from_: str | None = None,
-    deleted: list[str] | None = None,
     batch_size: int = 100_000,
-):
+    on_record=None,
+    limit: int | None = None,
+) -> Path:
     """
-    Pass in the name of the collection to harvest, a path to a Parquet file
-    and an optional record limit (useful in testing). An on_record parameter can
-    be used if you'd like to run a function for every record that is harvested,
-    which is useful for a progress bar in the CLI.
+    Convert a downloaded MARCXML dump file (a ResourceSync full or delta dump,
+    optionally gzipped) into a Parquet file, keyed the same way as every other
+    podlake table via `_make_columns` (pod_record_id, goldrush_key, and the wide
+    MARC field/subfield columns).
 
-    Pass from_ (a YYYY-MM-DD date string) to only harvest records changed on or
-    after that date, which is how incremental updates are performed. When
-    harvesting a delta, pass a list as `deleted` to collect the pod_record_ids
-    of records POD reports as deleted, so they can be removed downstream.
-
-    batch_size is the number of records buffered in memory per Parquet row
-    group. Larger values make bigger row groups (marginally better for querying
-    the file directly) at the cost of substantially higher peak memory, because
-    podlake's MARC schema is very wide. Lower it on memory-constrained machines.
+    Records are streamed one at a time (see `_iter_marcxml_records`) so memory
+    stays bounded regardless of dump size; `batch_size` controls the Parquet
+    row-group buffer, the real memory driver on the wide MARC schema.
     """
-    set_ = oai.get_set(set_name)
-    if set_ is None:
-        raise ValueError(f"Unknown pod set name {set_name}")
-    set_id = set_.setSpec  # ty: ignore[unresolved-attribute]
-
-    columns = _make_columns(set_name)
-    records = _record_iterator(
-        set_id,
-        set_name,
-        limit=limit,
-        on_record=on_record,
-        from_=from_,
-        deleted=deleted,
-    )
+    columns = _make_columns(org)
+    records = _dump_record_iterator(marcxml_path, on_record=on_record, limit=limit)
     to_parquet(records, parquet_path.open("wb"), columns=columns, batch_size=batch_size)
-
     return parquet_path
 
 
-def _record_iterator(
-    set_id: str,
-    org: str,
-    limit: int | None = None,
-    on_record=None,
-    from_: str | None = None,
-    deleted: list[str] | None = None,
+def _dump_record_iterator(
+    marcxml_path: Path, on_record=None, limit: int | None = None
 ) -> Iterator[pymarc.Record]:
-    # TODO: use on disk dictionary?
-    seen = set()
-    try:
-        oai_records = enumerate(oai.list_records(set_id, from_=from_))
-        for count, oai_record in oai_records:
-            if limit is not None and count >= limit:
-                break
-
-            rec_id = oai_record.header.identifier
-            logger.debug(f"found oai record {count} with ID {rec_id}")
-
-            if rec_id is None:
-                logger.warning(f"skipping oai record {count} without an identifier")
-                continue
-
-            if rec_id in seen:
-                logger.info(f"skipping previous version of oai record {rec_id}")
-                continue
-            else:
-                seen.add(rec_id)
-
-            if on_record:
-                on_record(count + 1)
-
-            # POD reports deletions as records with a deleted header and no MARC
-            # body. Collect their pod_record_id so they can be removed from the
-            # lake, and don't yield them for conversion.
-            if oai_record.deleted:
-                if deleted is not None:
-                    deleted.append(_deleted_pod_record_id(org, rec_id))
-                continue
-
-            marc_rec = _oai_to_marc_record(oai_record.xml)
-
-            if marc_rec is not None:
-                yield marc_rec
-    except NoRecordsMatch:
-        # An empty delta (nothing changed since from_) is not an error.
-        logger.info(f"no records match for set {set_id} from {from_}")
-        return
+    for count, record in enumerate(_iter_marcxml_records(marcxml_path)):
+        if limit is not None and count >= limit:
+            break
+        if on_record:
+            on_record(count + 1)
+        yield record
 
 
-def _deleted_pod_record_id(org: str, identifier: str) -> str:
+def _iter_marcxml_records(path: Path) -> Iterator[pymarc.Record]:
     """
-    Derive a pod_record_id from an OAI identifier for a deleted record, which
-    carries no MARC body. The identifier's final colon-delimited segment is the
-    MARC 001 control number, e.g. "oai:pod.stanford.edu:stanford:a1" -> the
-    pod_record_id "stanford:a1", matching how ids are minted for live records.
+    Stream `pymarc.Record`s from a MARCXML file, transparently handling gzip.
+    Uses lxml `iterparse` and clears elements as it goes so a multi-GB dump is
+    parsed in constant memory.
     """
-    local_id = identifier.split(":")[-1]
-    return f"{org}:{local_id}"
+    opener = gzip.open if path.suffix == ".gz" else open
+    with opener(path, "rb") as fh:
+        for _event, el in etree.iterparse(
+            fh, events=("end",), tag=f"{{{MARC_NS}}}record"
+        ):
+            record = _marc_element_to_record(el)
+            if record is not None:
+                yield record
+            # free the element and any preceding siblings to bound memory
+            el.clear()
+            while el.getprevious() is not None:
+                del el.getparent()[0]
 
 
-def _oai_to_marc_record(el: Element) -> pymarc.Record | None:
+def _marc_element_to_record(marc_el: Element) -> pymarc.Record | None:
     """
-    Construct a pymarc.Record object based on the MARCXML in an OAI record.
+    Construct a pymarc.Record from a MARCXML `record` element (namespace-agnostic
+    via local names). Shared by every ingestion source.
     """
     record = pymarc.Record()
-    marc_el = el.find(".//marc:record", namespaces=oai.XML_NS)
-    if marc_el is None:
-        logger.warning(f"No MARC XML record found in XML: {tostring(el)}")
-        return None
 
     for child in marc_el:
         local = QName(child).localname

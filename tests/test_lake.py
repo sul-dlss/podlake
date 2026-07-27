@@ -1,5 +1,5 @@
 import os
-from datetime import date
+from datetime import UTC, datetime
 from pathlib import Path
 
 import boto3
@@ -98,12 +98,12 @@ def test_reload_is_idempotent(tmp_path, parquet_files):
     con.close()
 
 
-def test_apply_update_upserts_and_deletes(tmp_path, parquet_files):
+def test_apply_resource_upserts_and_deletes(tmp_path, parquet_files):
     stanford, _ = parquet_files
     con = lake.connect(read_only=False, config=_dev_config(tmp_path))
     lake.load_parquet(con, stanford, "stanford")
 
-    # a delta: a1 changes title, a3 is new; a2 will be deleted
+    # a delta resource: a1 changes title, a3 is new
     delta = tmp_path / "stanford-delta.parquet"
     _make_parquet(
         delta,
@@ -120,11 +120,14 @@ def test_apply_update_upserts_and_deletes(tmp_path, parquet_files):
             },
         ],
     )
+    ts1 = datetime(2026, 2, 12, 3, 40, tzinfo=UTC)
+    changed, _ = lake.apply_resource(con, "stanford", "delta", delta, ts1)
+    assert changed == 2
 
-    changed, deleted = lake.apply_update(
-        con, "stanford", delta, ["stanford:a2"], date(2026, 7, 26)
-    )
-    assert (changed, deleted) == (2, 1)
+    # a deletes resource removes a2
+    ts2 = datetime(2026, 2, 13, 3, 40, tzinfo=UTC)
+    _, deleted = lake.apply_resource(con, "stanford", "deletes", ["stanford:a2"], ts2)
+    assert deleted == 1
 
     rows = dict(
         con.execute(
@@ -138,7 +141,8 @@ def test_apply_update_upserts_and_deletes(tmp_path, parquet_files):
         "stanford:a3": "Concerto",
     }
 
-    assert lake.get_last_harvest(con, "stanford") == date(2026, 7, 26)
+    # cursor advanced to the last resource's lastmod
+    assert lake.get_cursor(con, "stanford") == ts2
     con.close()
 
 
@@ -180,9 +184,9 @@ def test_publish_rejects_postgres_catalog(tmp_path):
         lake.publish(pg_config, "s3://pod-public/lake")
 
 
-def test_get_last_harvest_absent(tmp_path):
+def test_get_cursor_absent(tmp_path):
     con = lake.connect(read_only=False, config=_dev_config(tmp_path))
-    assert lake.get_last_harvest(con, "stanford") is None
+    assert lake.get_cursor(con, "stanford") is None
     con.close()
 
 
