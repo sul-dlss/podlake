@@ -124,6 +124,21 @@ roughly one resource at a time, not the whole chain:
 $ uvx podlake sync stanford --batch-size 10000
 ```
 
+## Fetch raw Parquet (data collection)
+
+To inspect the converted data without loading it into a DuckLake, `fetch`
+downloads and converts an organization's ResourceSync dumps to Parquet files on
+disk and stops there — no lake, no cursor, none of the load cost. Use
+`--full-only` to grab just the base full dump:
+
+```
+$ uvx podlake fetch stanford ./out --full-only
+```
+
+Each MARCXML resource becomes a `.parquet` in the output directory (delete files
+are copied as-is). This is handy for measuring things like column sparsity on
+real data.
+
 ## Load pre-built Parquet (optional)
 
 `sync` is the normal way to ingest. As an escape hatch, `load` ingests an

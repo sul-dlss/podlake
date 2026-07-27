@@ -191,6 +191,95 @@ def _sync_org(
 
 
 @app.command()
+def fetch(
+    org_name: Annotated[str, typer.Argument(help="Organization name")],
+    output_dir: Annotated[
+        Path,
+        typer.Argument(help="Directory to write Parquet files", file_okay=False),
+    ],
+    full_only: Annotated[
+        bool,
+        typer.Option(help="Fetch only the base full dump (skip deltas and deletes)"),
+    ] = False,
+    batch_size: Annotated[
+        int,
+        typer.Option(
+            help="Records buffered per Parquet row group. Lower it to reduce "
+            "peak memory on constrained machines."
+        ),
+    ] = 100_000,
+    limit: Annotated[
+        int | None,
+        typer.Option(help="Limit records per resource (useful for testing)"),
+    ] = None,
+):
+    """
+    Download and convert an organization's ResourceSync dumps to Parquet files
+    on disk, WITHOUT loading them into the DuckLake. Useful for inspecting the
+    raw converted data (schema, column sparsity, sizes) without paying for a
+    load. Use --full-only for just the base full dump.
+    """
+    get_config()
+    found = resourcesync.get_streams(org_name)
+    if not found:
+        typer.echo(f"No ResourceSync stream found for {org_name}", err=True)
+        raise typer.Exit(code=1)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for name, url in found.items():
+        written, total = _fetch_org(name, url, output_dir, full_only, batch_size, limit)
+        print(
+            f"[bold]{name}[/bold]: wrote {written} files "
+            f"({humanize.naturalsize(total)}) to {output_dir}"
+        )
+
+
+def _fetch_org(
+    org: str,
+    resourcelist_url: str,
+    output_dir: Path,
+    full_only: bool,
+    batch_size: int,
+    limit: int | None,
+) -> tuple[int, int]:
+    resources = resourcesync.get_resources(resourcelist_url)
+    if full_only:
+        resources = [r for r in resources if r.kind == "full"]
+
+    written = total_bytes = 0
+    for resource in resources:
+        name = resource.url.rstrip("/").split("/")[-1]
+        if resource.kind == "deletes":
+            dest = output_dir / name
+            resourcesync.download(resource.url, dest, fixity=resource.fixity)
+            total_bytes += dest.stat().st_size
+            written += 1
+            continue
+
+        stem = name.removesuffix(".gz").removesuffix(".xml")
+        out = output_dir / f"{stem}.parquet"
+        with tempfile.TemporaryDirectory() as tmp:
+            suffix = ".xml.gz" if resource.url.endswith(".gz") else ".xml"
+            dl_path = Path(tmp) / f"resource{suffix}"
+            resourcesync.download(resource.url, dl_path, fixity=resource.fixity)
+            with tqdm(
+                desc=f"{org} {resource.kind}", unit=" records", smoothing=0.01
+            ) as progress:
+                dump_to_parquet(
+                    org,
+                    dl_path,
+                    out,
+                    batch_size=batch_size,
+                    on_record=lambda _: progress.update(1),
+                    limit=limit,
+                )
+        total_bytes += out.stat().st_size
+        written += 1
+
+    return written, total_bytes
+
+
+@app.command()
 def load(
     path: Annotated[
         Path,
