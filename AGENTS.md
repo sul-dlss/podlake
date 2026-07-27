@@ -4,10 +4,11 @@ Guidance for agents (and humans) working in podlake.
 
 ## What podlake is
 
-A command-line tool that harvests MARC XML from POD's OAI-PMH service, converts
-it to Parquet with marctable, loads it into a DuckLake store, keeps it current
-with incremental updates, and can publish it to S3 for read-only consumers. See
-`README.md` for the user-facing workflow.
+A command-line tool that syncs MARC XML from POD's ResourceSync service (full
+dump + daily deltas + delete files), converts it to Parquet with marctable,
+loads it into a DuckLake store, keeps it current with incremental syncs, and can
+publish it to S3 for read-only consumers. See `README.md` for the user-facing
+workflow.
 
 ## Checks to run before opening or reviewing a PR
 
@@ -20,8 +21,9 @@ uv run ty check .        # type check
 uv run pytest           # tests
 ```
 
-`test_oai` and `test_convert` make live calls to POD and need
-`PODBUCKET_POD_TOKEN`; the DuckLake and storage tests run fully locally.
+The tests run fully locally (no network or `PODBUCKET_POD_TOKEN`): ResourceSync
+manifest parsing uses fixtures, conversion uses small in-test MARCXML dumps, and
+the lake/publish paths use a temporary lake with moto-mocked S3.
 
 ## Code review checklist
 
@@ -49,6 +51,7 @@ Also worth checking:
   — keep it that way).
 - **Build hygiene.** ruff/ty/pytest clean, no new warnings.
 - **Spec adherence.** Follow the conventions of the systems podlake bridges:
-  OAI-PMH (sets, `from` date granularity, `deletedRecord` semantics), MARC /
-  MARCXML (control vs data fields, the 001 as record id), and DuckLake
-  (snapshots, partitioning, merge-on-read delete files, read-only attach).
+  ResourceSync (capability/resource lists, full vs delta dumps, delete files,
+  processing resources in `lastmod` order), MARC / MARCXML (control vs data
+  fields, the 001 as record id), and DuckLake (snapshots, partitioning,
+  merge-on-read delete files, read-only attach).

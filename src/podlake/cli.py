@@ -1,27 +1,18 @@
-import os
 import tempfile
-import threading
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated
 
 import duckdb
+import humanize
 import typer
 from rich import print
 from tqdm import tqdm
-from tqdm.contrib.concurrent import thread_map
 
-from podlake import lake
+from podlake import lake, resourcesync
 from podlake.config import get_config
-from podlake.convert import oai_to_parquet
-from podlake.oai import get_set, list_sets
+from podlake.convert import dump_to_parquet
 
 app = typer.Typer()
-
-# tqdm defaults to multiprocessing.RLock, which creates a named OS semaphore.
-# Using threading.RLock avoids that so os._exit() on Ctrl-C doesn't leave a
-# leaked semaphore that triggers a resource_tracker warning at shutdown.
-tqdm.set_lock(threading.RLock())
 
 
 @app.command()
@@ -50,7 +41,7 @@ def config():
         else:
             print(
                 "[green]✓ connected to the DuckLake[/green] "
-                "[yellow](no records loaded yet — run `podlake load`)[/yellow]"
+                "[yellow](no records yet — run `podlake sync`)[/yellow]"
             )
         con.close()
     except duckdb.Error as e:
@@ -58,69 +49,75 @@ def config():
         # a normal state, not a configuration error.
         print(
             "[yellow]! could not attach to the DuckLake — it may not be built "
-            f"yet (run `podlake load`): {e}[/yellow]"
+            f"yet (run `podlake sync`): {e}[/yellow]"
         )
 
 
 @app.command()
-def sets():
-    """
-    Output the sets available.
-    """
-    get_config()
-    for s in list_sets():
-        print(f"- [bold]{s.contributor}[/bold] id={s.setSpec}")  # ty: ignore[unresolved-attribute]
-
-
-@app.command()
-def convert(
-    org_name: Annotated[str, typer.Argument(help="Organization name")],
-    output_path: Annotated[
-        Path, typer.Argument(help="Path to write Parquet file", dir_okay=False)
-    ],
-    limit: Annotated[int | None, typer.Option(help="Limit number of records")] = None,
-    batch_size: Annotated[
-        int,
-        typer.Option(
-            help="Records buffered per Parquet row group. Lower it to reduce "
-            "peak memory on constrained machines."
-        ),
-    ] = 100_000,
+def streams(
+    org_name: Annotated[
+        str | None, typer.Argument(help="Limit to one organization")
+    ] = None,
 ):
     """
-    Harvest records for the given organization name: e.g. "stanford" and write
-    them to the supplied parquet file path.
+    List POD organizations (ResourceSync streams) and how many resources each
+    has (full dump + deltas + deletes), with total download size.
     """
     get_config()
-
-    set_ = get_set(org_name.lower())
-    if set_ is None:
-        typer.echo(f"Can't find POD set for {org_name}", err=True)
+    found = resourcesync.get_streams(org_name)
+    if not found:
+        typer.echo(f"No ResourceSync stream found for {org_name}", err=True)
         raise typer.Exit(code=1)
 
-    with tqdm(
-        desc=f"harvesting {org_name}", unit=" records", smoothing=0.01
-    ) as progress:
-        oai_to_parquet(
-            org_name,
-            output_path,
-            limit,
-            on_record=lambda _: progress.update(1),
-            batch_size=batch_size,
+    for name, url in sorted(found.items()):
+        resources = resourcesync.get_resources(url)
+        total = sum(r.length for r in resources)
+        print(
+            f"- [bold]{name}[/bold]: {len(resources)} resources, "
+            f"{humanize.naturalsize(total)}"
         )
 
 
 @app.command()
-def convert_all(
-    output_dir: Annotated[
-        Path,
-        typer.Argument(
-            help="Directory to write Parquet files", dir_okay=True, file_okay=False
+def sync(
+    org_name: Annotated[str, typer.Argument(help="Organization name")],
+    batch_size: Annotated[
+        int,
+        typer.Option(
+            help="Records buffered per Parquet row group. Lower it to reduce "
+            "peak memory on constrained machines."
         ),
-    ],
-    workers: Annotated[
-        int, typer.Option(help="Number of worker processes to use in parallel")
-    ] = 1,
+    ] = 100_000,
+    limit: Annotated[
+        int | None,
+        typer.Option(help="Limit records per resource (useful for testing)"),
+    ] = None,
+):
+    """
+    Sync one organization from POD ResourceSync into the DuckLake. Processes
+    every resource (full dump + deltas + deletes) newer than the org's cursor:
+    the first run does a full initial load, later runs apply only new deltas.
+    """
+    get_config()
+    found = resourcesync.get_streams(org_name)
+    if not found:
+        typer.echo(f"No ResourceSync stream found for {org_name}", err=True)
+        raise typer.Exit(code=1)
+
+    con = lake.connect(read_only=False)
+    try:
+        for name, url in found.items():
+            changed, deleted, n = _sync_org(con, name, url, batch_size, limit)
+            print(
+                f"[bold]{name}[/bold]: {n} resources processed, "
+                f"{changed} changed, {deleted} deleted"
+            )
+    finally:
+        con.close()
+
+
+@app.command()
+def sync_all(
     batch_size: Annotated[
         int,
         typer.Option(
@@ -130,53 +127,67 @@ def convert_all(
     ] = 100_000,
 ):
     """
-    Harvest all records and write them organization specific parquet files in
-    the supplied directory. Use --workers to control the number of concurrent
-    workers to use.
+    Sync every organization from POD ResourceSync into the DuckLake, one at a
+    time. Each resource is its own transaction (DuckLake snapshot), so an
+    interrupted run resumes cleanly from where it left off.
     """
     get_config()
-    if output_dir.is_dir() is False:
-        output_dir.mkdir(parents=True)
 
-    sets = list_sets()
-    set_args = [(s.contributor, output_dir, batch_size) for s in sets]  # ty: ignore[unresolved-attribute]
-
+    con = lake.connect(read_only=False)
     try:
-        thread_map(_convert, set_args, max_workers=workers, desc="converting sets")
-    except KeyboardInterrupt:
-        typer.echo("\ninterrupted", err=True)
-        # os._exit bypasses Python's atexit handlers, including the one in
-        # concurrent.futures that joins all threads. Without this, a second
-        # KeyboardInterrupt raised during that join produces a traceback.
-        os._exit(1)
+        for name, url in sorted(resourcesync.get_streams().items()):
+            changed, deleted, n = _sync_org(con, name, url, batch_size, None)
+            print(
+                f"[bold]{name}[/bold]: {n} resources processed, "
+                f"{changed} changed, {deleted} deleted"
+            )
+    finally:
+        con.close()
 
 
-_thread_local = threading.local()
-_next_position = 0
-_position_lock = threading.Lock()
+def _sync_org(
+    con: duckdb.DuckDBPyConnection,
+    org: str,
+    resourcelist_url: str,
+    batch_size: int,
+    limit: int | None,
+) -> tuple[int, int, int]:
+    cursor = lake.get_cursor(con, org)
+    resources = resourcesync.get_resources(resourcelist_url)
+    pending = [r for r in resources if cursor is None or r.lastmod > cursor]
 
-
-def _thread_position():
-    if not hasattr(_thread_local, "position"):
-        global _next_position
-        with _position_lock:
-            _next_position += 1
-            _thread_local.position = _next_position
-    return _thread_local.position
-
-
-def _convert(set_args):
-    set_name, output_dir, batch_size = set_args
-    parquet_path = output_dir / f"{set_name}.parquet"
-    with tqdm(
-        desc=set_name, unit=" records", smoothing=0.01, position=_thread_position()
-    ) as progress:
-        oai_to_parquet(
-            set_name,
-            parquet_path,
-            on_record=lambda _: progress.update(1),
-            batch_size=batch_size,
-        )
+    total_changed = total_deleted = 0
+    for resource in pending:
+        with tempfile.TemporaryDirectory() as tmp:
+            if resource.kind == "deletes":
+                del_path = Path(tmp) / "deletes.txt"
+                resourcesync.download(resource.url, del_path, fixity=resource.fixity)
+                ids = [f"{org}:{rid}" for rid in resourcesync.read_delete_ids(del_path)]
+                _, deleted = lake.apply_resource(
+                    con, org, "deletes", ids, resource.lastmod
+                )
+                total_deleted += deleted
+            else:
+                suffix = ".xml.gz" if resource.url.endswith(".gz") else ".xml"
+                dl_path = Path(tmp) / f"resource{suffix}"
+                resourcesync.download(resource.url, dl_path, fixity=resource.fixity)
+                parquet_path = Path(tmp) / "resource.parquet"
+                with tqdm(
+                    desc=f"{org} {resource.kind}", unit=" records", smoothing=0.01
+                ) as progress:
+                    dump_to_parquet(
+                        org,
+                        dl_path,
+                        parquet_path,
+                        batch_size=batch_size,
+                        on_record=lambda _: progress.update(1),
+                        limit=limit,
+                    )
+                changed, _ = lake.apply_resource(
+                    con, org, resource.kind, parquet_path, resource.lastmod
+                )
+                total_changed += changed
+    return total_changed, total_deleted, len(pending)
 
 
 @app.command()
@@ -197,9 +208,10 @@ def load(
     ] = None,
 ):
     """
-    Build or refresh the DuckLake by loading Parquet produced by `convert` or
-    `convert-all` into the unified `records` table, partitioned by org. Loading
-    an org that already exists replaces its rows, so this is safe to re-run.
+    Load an existing Parquet file (or a directory of per-org Parquet files) into
+    the unified `records` table, partitioned by org. Loading an org that already
+    exists replaces its rows, so this is safe to re-run. Most ingestion should
+    use `sync`; this is a manual escape hatch for pre-built Parquet.
     """
     get_config()
 
@@ -277,83 +289,6 @@ def publish(
     print(
         f"    (DATA_PATH '{base}/{data_prefix}/', READ_ONLY, OVERRIDE_DATA_PATH true);"
     )
-
-
-@app.command()
-def update(
-    org_name: Annotated[str, typer.Argument(help="Organization name")],
-    since: Annotated[
-        str | None,
-        typer.Option(
-            help="Override the from date (YYYY-MM-DD); defaults to the org's "
-            "last-harvest date, or a full harvest if it has never been harvested"
-        ),
-    ] = None,
-):
-    """
-    Incrementally update one organization in the DuckLake: harvest records
-    changed since its last harvest, upsert them, apply any deletions POD
-    reports, and record today as the new last-harvest date.
-    """
-    get_config()
-
-    set_ = get_set(org_name.lower())
-    if set_ is None:
-        typer.echo(f"Can't find POD set for {org_name}", err=True)
-        raise typer.Exit(code=1)
-
-    con = lake.connect(read_only=False)
-    try:
-        changed, deleted = _update_org(con, org_name, since=since)
-        print(f"[bold]{org_name}[/bold]: {changed} changed, {deleted} deleted")
-    finally:
-        con.close()
-
-
-@app.command()
-def update_all():
-    """
-    Incrementally update every organization in the DuckLake, one at a time.
-    Each org is its own transaction (DuckLake snapshot), so a failure part way
-    through leaves already-updated orgs committed.
-    """
-    get_config()
-
-    con = lake.connect(read_only=False)
-    try:
-        for s in list_sets():
-            org_name = s.contributor  # ty: ignore[unresolved-attribute]
-            changed, deleted = _update_org(con, org_name)
-            print(f"[bold]{org_name}[/bold]: {changed} changed, {deleted} deleted")
-    finally:
-        con.close()
-
-
-def _update_org(
-    con: duckdb.DuckDBPyConnection, org_name: str, since: str | None = None
-) -> tuple[int, int]:
-    if since is not None:
-        from_ = since
-    else:
-        last = lake.get_last_harvest(con, org_name)
-        from_ = last.isoformat() if last else None
-
-    deleted: list[str] = []
-    with tempfile.TemporaryDirectory() as tmp:
-        delta_path = Path(tmp) / f"{org_name}.parquet"
-        with tqdm(
-            desc=f"updating {org_name}", unit=" records", smoothing=0.01
-        ) as progress:
-            oai_to_parquet(
-                org_name,
-                delta_path,
-                from_=from_,
-                deleted=deleted,
-                on_record=lambda _: progress.update(1),
-            )
-        # OAI datestamps are UTC, so record the harvest date in UTC too.
-        harvest_date = datetime.now(UTC).date()
-        return lake.apply_update(con, org_name, delta_path, deleted, harvest_date)
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@
 
 [![Tests](https://github.com/sul-dlss/podlake/actions/workflows/test.yml/badge.svg)](https://github.com/sul-dlss/podlake/actions/workflows/test.yml)
 
-podlake harvests MARC XML data from [POD]'s OAI-PMH service, converts it to
+podlake syncs MARC XML data from [POD]'s [ResourceSync] service, converts it to
 Parquet with [marctable], and loads it into a [DuckLake] lakehouse so it can be
 queried with DuckDB.
 
@@ -14,13 +14,18 @@ so use a DuckLake-aware client. Multi-engine access (Spark, Trino/Athena) is on
 DuckLake's roadmap but not yet practical; if you need that today, Iceberg is the
 better-supported format.
 
-The data flows in three steps:
+The data flows in two steps:
 
-1. **harvest + convert** — `podlake convert` / `convert-all` pull MARC records
-   from POD and write Parquet files (one per organization).
-2. **load** — `podlake load` loads those Parquet files into a single DuckLake
-   `records` table, partitioned by organization.
-3. **query** — analysts attach to the DuckLake read-only and run SQL.
+1. **sync** — `podlake sync` / `sync-all` download POD's ResourceSync dump files
+   (a base full dump plus a chain of daily delta and delete files), convert them
+   to Parquet, and upsert them into a single DuckLake `records` table,
+   partitioned by organization.
+2. **query** — analysts attach to the DuckLake read-only and run SQL.
+
+podlake uses ResourceSync rather than POD's OAI-PMH endpoint because the dump
+files are static downloads (fast, no server-side paging) and carry explicit,
+durable deletions. A consequence is that the lake is only as current as POD's
+most recently published delta.
 
 ## Install
 
@@ -80,80 +85,58 @@ Check the resolved profile and confirm podlake can reach the lake:
 $ uvx podlake config
 ```
 
-## Harvest and convert
+## Sync from POD
 
-List the organizations (OAI sets) available:
-
-```
-$ uvx podlake sets
-```
-
-Harvest a single provider to a Parquet file:
+List the organizations (ResourceSync streams) available, with how many resources
+(full dump + deltas + deletes) each has and their total download size:
 
 ```
-$ uvx podlake convert stanford stanford.parquet
+$ uvx podlake streams
 ```
 
-Harvest every provider to its own Parquet file in a directory. By default this
-runs one worker at a time; use `--workers` to harvest concurrently:
+Sync an organization into the DuckLake:
 
 ```
-$ uvx podlake convert-all ./output/ --workers 4
+$ uvx podlake sync stanford      # one organization
+$ uvx podlake sync-all           # every organization, one at a time
 ```
 
-Harvesting buffers records in memory per Parquet row group. Because the MARC
-schema is very wide, the default (`--batch-size 100000`) can use several GB of
-RAM for a large provider; lower it on memory-constrained machines:
+`sync` processes every ResourceSync resource newer than the org's cursor, in
+chronological order: the base full dump, then each daily delta (upserted into
+`records` by `pod_record_id`) and delete file (removed). The **first run does
+the full initial load; later runs apply only new deltas** — one command for both.
+Each resource is applied in its own transaction (one DuckLake snapshot) and
+advances the org's cursor (stored in the lake's `harvest_state` table), so an
+interrupted `sync` resumes cleanly from where it left off. Run `sync-all` on a
+schedule (cron, a systemd timer, a Kubernetes CronJob, or GitHub Actions) to
+keep the lake current.
+
+Deletions are explicit and durable in ResourceSync (POD publishes delete files),
+so no records linger after they are removed upstream.
+
+Syncing buffers records in memory per Parquet row group. Because the MARC schema
+is very wide, the default (`--batch-size 100000`) can use several GB of RAM on a
+large full dump; lower it on memory-constrained machines. Dumps are streamed and
+temporary files are cleaned up as each resource is processed, so peak disk use is
+roughly one resource at a time, not the whole chain:
 
 ```
-$ uvx podlake convert stanford stanford.parquet --batch-size 10000
+$ uvx podlake sync stanford --batch-size 10000
 ```
 
-## Build the lake
+## Load pre-built Parquet (optional)
 
-Load the Parquet files into the DuckLake. Point `load` at a directory to load
-every `*.parquet` (using each file name as the organization), or at a single
-file:
+`sync` is the normal way to ingest. As an escape hatch, `load` ingests an
+existing Parquet file (or a directory of per-org files, using each file name as
+the organization) into the same `records` table:
 
 ```
 $ uvx podlake load ./output/
 $ uvx podlake load stanford.parquet --org stanford
 ```
 
-Everything lands in one `records` table partitioned by `org`. Loading an
-organization that is already present replaces its rows, so `load` is safe to
-re-run.
-
-## Keep the lake up to date
-
-Once the lake exists, harvest only what has changed instead of rebuilding it.
-`update` harvests the records an organization has changed since it was last
-harvested, upserts them into `records` (keyed by `pod_record_id`), removes any
-records POD reports as deleted, and records today as the org's new last-harvest
-date — all in a single transaction, so each update is one DuckLake snapshot.
-
-```
-$ uvx podlake update stanford      # one organization
-$ uvx podlake update-all           # every organization, one at a time
-```
-
-The last-harvest date for each org is stored in the lake itself, in a
-`harvest_state` table. The first `update` for an org (with no recorded date)
-does a full harvest to establish the baseline; subsequent runs are deltas. You
-can override the start date with `--since`:
-
-```
-$ uvx podlake update stanford --since 2026-04-01
-```
-
-Run `update-all` on a schedule (cron, a systemd timer, a Kubernetes CronJob, or
-GitHub Actions) to keep the lake current.
-
-> **Note on deletions.** POD's OAI-PMH service reports deletions only
-> *transiently* (`deletedRecord: transient`), so deletions are reliably applied
-> as long as you update regularly. If updates lapse for a long time, reconcile
-> by re-harvesting from scratch (`convert` / `convert-all` then `load`, or an
-> `update --since` covering the gap).
+Loading an organization that is already present replaces its rows, so `load` is
+safe to re-run.
 
 ## Publish for read-only consumers
 
@@ -167,10 +150,10 @@ dataset:
 $ uvx podlake publish s3://your-bucket/pod   # or set PODLAKE_PUBLISH_URL
 ```
 
-A typical weekly cycle is `update-all` then `publish` (run on whatever schedule
-you like). Because publishing is a plain upload, the maintainer's writable lake
-never needs to be reachable by consumers — only the bucket does. See "Query the
-lake" for how consumers attach.
+A typical cycle is `sync-all` then `publish` (run on whatever schedule you like).
+Because publishing is a plain upload, the maintainer's writable lake never needs
+to be reachable by consumers — only the bucket does. See "Query the lake" for how
+consumers attach.
 
 ## Query the lake
 
@@ -235,11 +218,13 @@ Clone the repository, make changes, and run the tests:
 $ uv run pytest
 ```
 
-The `test_oai` and `test_convert` tests perform live harvests against POD and
-require `PODBUCKET_POD_TOKEN`. The `test_lake` tests run entirely locally against
-a temporary development-profile lake.
+The tests run entirely locally (no network or `PODBUCKET_POD_TOKEN` needed):
+ResourceSync manifest parsing is tested with fixtures, MARCXML conversion with
+small in-test dumps, and the lake/publish paths against a temporary
+development-profile lake (S3 is mocked with moto).
 
 [POD]: https://pod.stanford.edu/
+[ResourceSync]: https://www.openarchives.org/rs/toc
 [uv]: https://docs.astral.sh/uv/
 [marctable]: https://github.com/sul-dlss-labs/marctable
 [DuckLake]: https://ducklake.select/
