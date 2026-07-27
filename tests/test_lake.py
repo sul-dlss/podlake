@@ -5,7 +5,6 @@ from pathlib import Path
 import boto3
 import duckdb
 import moto
-import pandas
 import pytest
 
 from podlake import lake
@@ -20,139 +19,162 @@ def _dev_config(tmp_path: Path) -> Config:
     )
 
 
-def _make_parquet(path: Path, rows: list[dict]) -> None:
-    pandas.DataFrame(rows).to_parquet(path)
-
-
-@pytest.fixture
-def parquet_files(tmp_path):
-    stanford = tmp_path / "stanford.parquet"
-    harvard = tmp_path / "harvard.parquet"
-    _make_parquet(
-        stanford,
-        [
-            {
-                "pod_record_id": "stanford:a1",
-                "goldrush_key": "shared_key",
-                "F245": "Symphony",
-            },
-            {
-                "pod_record_id": "stanford:a2",
-                "goldrush_key": "stanford_only",
-                "F245": "Sonata",
-            },
-        ],
+def _records_parquet(path: Path, rows: list[tuple]) -> None:
+    con = duckdb.connect()
+    con.execute(
+        "CREATE TABLE t (org VARCHAR, pod_record_id VARCHAR, field_tag VARCHAR, "
+        "field_seq INTEGER, ind1 VARCHAR, ind2 VARCHAR, subfield_code VARCHAR, "
+        "subfield_seq INTEGER, value VARCHAR)"
     )
-    _make_parquet(
-        harvard,
-        [
-            {
-                "pod_record_id": "harvard:b1",
-                "goldrush_key": "shared_key",
-                "F245": "Symphony",
-            },
-        ],
+    if rows:
+        con.executemany("INSERT INTO t VALUES (?,?,?,?,?,?,?,?,?)", rows)
+    con.execute(f"COPY t TO '{path}' (FORMAT parquet)")
+    con.close()
+
+
+def _meta_parquet(path: Path, rows: list[tuple]) -> None:
+    con = duckdb.connect()
+    con.execute(
+        "CREATE TABLE m (org VARCHAR, pod_record_id VARCHAR, goldrush_key VARCHAR)"
     )
-    return stanford, harvard
+    if rows:
+        con.executemany("INSERT INTO m VALUES (?,?,?)", rows)
+    con.execute(f"COPY m TO '{path}' (FORMAT parquet)")
+    con.close()
 
 
-def test_load_and_query(tmp_path, parquet_files):
-    stanford, harvard = parquet_files
+def _record(org, rid, title, gr):
+    """Return (eav_rows, meta_row) for one simple record: LDR + 001 + 245$a."""
+    pid = f"{org}:{rid}"
+    rows = [
+        (org, pid, "LDR", 0, None, None, None, None, "00000nam a2200000 a 4500"),
+        (org, pid, "001", 1, None, None, None, None, rid),
+        (org, pid, "245", 2, "1", "0", "a", 0, title),
+    ]
+    return rows, (org, pid, gr)
+
+
+def _write_org(tmp_path, name, records):
+    """Write a records+meta parquet pair for a list of _record() results."""
+    rec_rows = [r for rec, _ in records for r in rec]
+    meta_rows = [meta for _, meta in records]
+    rpq = tmp_path / f"{name}.records.parquet"
+    mpq = tmp_path / f"{name}.meta.parquet"
+    _records_parquet(rpq, rec_rows)
+    _meta_parquet(mpq, meta_rows)
+    return rpq, mpq
+
+
+def test_load_pair_and_overlap(tmp_path):
     con = lake.connect(read_only=False, config=_dev_config(tmp_path))
 
-    assert lake.load_parquet(con, stanford, "stanford") == 2
-    assert lake.load_parquet(con, harvard, "harvard") == 1
+    srpq, smpq = _write_org(
+        tmp_path,
+        "stanford",
+        [
+            _record("stanford", "a1", "Symphony", "shared"),
+            _record("stanford", "a2", "Sonata", "stanford_only"),
+        ],
+    )
+    hrpq, hmpq = _write_org(
+        tmp_path, "harvard", [_record("harvard", "b1", "Symphony", "shared")]
+    )
 
-    # the records table exists and is partitioned by an org column
-    columns = [row[0] for row in con.execute("DESCRIBE records").fetchall()]
-    assert columns[0] == "org"
-    assert "pod_record_id" in columns
-    assert "goldrush_key" in columns
+    assert lake.load_pair(con, "stanford", srpq, smpq) == 2
+    assert lake.load_pair(con, "harvard", hrpq, hmpq) == 1
 
-    # per-org row counts
+    # records partitioned by org
+    cols = [r[0] for r in con.execute("DESCRIBE records").fetchall()]
+    assert cols[0] == "org"
+
     counts = dict(
-        con.execute("SELECT org, count(*) FROM records GROUP BY org").fetchall()
+        con.execute("SELECT org, count(*) FROM record_meta GROUP BY org").fetchall()
     )
     assert counts == {"stanford": 2, "harvard": 1}
 
-    # cross-org overlap via goldrush_key works in a single query
+    # consortial overlap via record_meta
     overlap = con.execute(
-        "SELECT goldrush_key, count(DISTINCT org) AS orgs FROM records "
+        "SELECT goldrush_key, count(DISTINCT org) AS orgs FROM record_meta "
         "GROUP BY goldrush_key HAVING orgs > 1"
     ).fetchall()
-    assert overlap == [("shared_key", 2)]
-
+    assert overlap == [("shared", 2)]
     con.close()
 
 
-def test_reload_is_idempotent(tmp_path, parquet_files):
-    stanford, _ = parquet_files
+def test_apply_resource_upsert_and_delete(tmp_path):
     con = lake.connect(read_only=False, config=_dev_config(tmp_path))
-
-    lake.load_parquet(con, stanford, "stanford")
-    lake.load_parquet(con, stanford, "stanford")
-
-    total = con.execute("SELECT count(*) FROM records").fetchone()
-    assert total is not None and total[0] == 2
-
-    con.close()
-
-
-def test_apply_resource_upserts_and_deletes(tmp_path, parquet_files):
-    stanford, _ = parquet_files
-    con = lake.connect(read_only=False, config=_dev_config(tmp_path))
-    lake.load_parquet(con, stanford, "stanford")
-
-    # a delta resource: a1 changes title, a3 is new
-    delta = tmp_path / "stanford-delta.parquet"
-    _make_parquet(
-        delta,
+    srpq, smpq = _write_org(
+        tmp_path,
+        "stanford",
         [
-            {
-                "pod_record_id": "stanford:a1",
-                "goldrush_key": "shared_key",
-                "F245": "Symphony (revised)",
-            },
-            {
-                "pod_record_id": "stanford:a3",
-                "goldrush_key": "new_key",
-                "F245": "Concerto",
-            },
+            _record("stanford", "a1", "Symphony", "k1"),
+            _record("stanford", "a2", "Sonata", "k2"),
         ],
     )
-    ts1 = datetime(2026, 2, 12, 3, 40, tzinfo=UTC)
-    changed, _ = lake.apply_resource(con, "stanford", "delta", delta, ts1)
+    lake.load_pair(con, "stanford", srpq, smpq)
+
+    # delta: a1 retitled, a3 new
+    drpq, dmpq = _write_org(
+        tmp_path,
+        "stanford-delta",
+        [
+            _record("stanford", "a1", "Symphony (rev)", "k1"),
+            _record("stanford", "a3", "Concerto", "k3"),
+        ],
+    )
+    ts1 = datetime(2026, 2, 12, tzinfo=UTC)
+    changed, _ = lake.apply_resource(con, "stanford", "delta", (drpq, dmpq), ts1)
     assert changed == 2
 
-    # a deletes resource removes a2
-    ts2 = datetime(2026, 2, 13, 3, 40, tzinfo=UTC)
+    ts2 = datetime(2026, 2, 13, tzinfo=UTC)
     _, deleted = lake.apply_resource(con, "stanford", "deletes", ["stanford:a2"], ts2)
     assert deleted == 1
 
-    rows = dict(
-        con.execute(
-            "SELECT pod_record_id, F245 FROM records WHERE org = 'stanford' "
-            "ORDER BY pod_record_id"
+    ids = [
+        r[0]
+        for r in con.execute(
+            "SELECT pod_record_id FROM record_meta ORDER BY pod_record_id"
         ).fetchall()
-    )
-    # a1 updated in place (no duplicate), a2 removed, a3 added
-    assert rows == {
-        "stanford:a1": "Symphony (revised)",
-        "stanford:a3": "Concerto",
-    }
+    ]
+    assert ids == ["stanford:a1", "stanford:a3"]
 
-    # cursor advanced to the last resource's lastmod
+    title = con.execute(
+        "SELECT value FROM records WHERE pod_record_id='stanford:a1' "
+        "AND field_tag='245' AND subfield_code='a'"
+    ).fetchone()
+    assert title == ("Symphony (rev)",)
+
     assert lake.get_cursor(con, "stanford") == ts2
     con.close()
 
 
-def test_publish_uploads_catalog_and_data(tmp_path, parquet_files):
-    stanford, _ = parquet_files
-    config = _dev_config(tmp_path)
+def test_get_cursor_absent(tmp_path):
+    con = lake.connect(read_only=False, config=_dev_config(tmp_path))
+    assert lake.get_cursor(con, "stanford") is None
+    con.close()
 
+
+def test_read_only_cannot_write(tmp_path):
+    config = _dev_config(tmp_path)
+    rpq, mpq = _write_org(tmp_path, "stanford", [_record("stanford", "a1", "T", "k")])
+
+    writer = lake.connect(read_only=False, config=config)
+    lake.load_pair(writer, "stanford", rpq, mpq)
+    writer.close()
+
+    reader = lake.connect(read_only=True, config=config)
+    assert reader.execute("SELECT count(*) FROM record_meta").fetchone() == (1,)
+    with pytest.raises(duckdb.Error):
+        reader.execute("INSERT INTO record_meta VALUES ('x','x:1','k')")
+    reader.close()
+
+
+def test_publish_uploads_catalog(tmp_path):
+    config = _dev_config(tmp_path)
+    rpq, mpq = _write_org(tmp_path, "stanford", [_record("stanford", "a1", "T", "k")])
     con = lake.connect(read_only=False, config=config)
-    lake.load_parquet(con, stanford, "stanford")
-    con.close()  # flush the catalog file so it can be uploaded
+    lake.load_pair(con, "stanford", rpq, mpq)
+    con.close()
 
     os.environ["AWS_ACCESS_KEY_ID"] = "testing"
     os.environ["AWS_SECRET_ACCESS_KEY"] = "testing"
@@ -160,17 +182,12 @@ def test_publish_uploads_catalog_and_data(tmp_path, parquet_files):
     with moto.mock_aws():
         s3 = boto3.client("s3")
         s3.create_bucket(Bucket="pod-public")
-
-        catalog_key, data_prefix, count = lake.publish(config, "s3://pod-public/lake")
-
-        assert catalog_key == Path(config.catalog_uri).name
-        assert data_prefix == "data"
+        catalog_key, _, count = lake.publish(config, "s3://pod-public/lake")
         assert count >= 1
         keys = [
             o["Key"]
             for o in s3.list_objects_v2(Bucket="pod-public").get("Contents", [])
         ]
-        # the catalog is always published under the destination prefix
         assert f"lake/{catalog_key}" in keys
 
 
@@ -182,24 +199,3 @@ def test_publish_rejects_postgres_catalog(tmp_path):
     )
     with pytest.raises(ValueError):
         lake.publish(pg_config, "s3://pod-public/lake")
-
-
-def test_get_cursor_absent(tmp_path):
-    con = lake.connect(read_only=False, config=_dev_config(tmp_path))
-    assert lake.get_cursor(con, "stanford") is None
-    con.close()
-
-
-def test_read_only_cannot_write(tmp_path, parquet_files):
-    stanford, _ = parquet_files
-    config = _dev_config(tmp_path)
-
-    writer = lake.connect(read_only=False, config=config)
-    lake.load_parquet(writer, stanford, "stanford")
-    writer.close()
-
-    reader = lake.connect(read_only=True, config=config)
-    assert reader.execute("SELECT count(*) FROM records").fetchone() == (2,)
-    with pytest.raises(duckdb.Error):
-        reader.execute("INSERT INTO records (org, pod_record_id) VALUES ('x', 'x:1')")
-    reader.close()

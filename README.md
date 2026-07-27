@@ -18,9 +18,16 @@ The data flows in two steps:
 
 1. **sync** — `podlake sync` / `sync-all` download POD's ResourceSync dump files
    (a base full dump plus a chain of daily delta and delete files), convert them
-   to Parquet, and upsert them into a single DuckLake `records` table,
-   partitioned by organization.
+   to Parquet, and upsert them into DuckLake. MARC is stored in a tall
+   `records` table — **one row per subfield** — plus a small `record_meta` table
+   (one row per record, with `goldrush_key`), both partitioned by organization.
 2. **query** — analysts attach to the DuckLake read-only and run SQL.
+
+The tall (EAV) `records` layout is deliberate: it loads into DuckLake orders of
+magnitude faster and cheaper than a wide one-column-per-field table, every MARC
+field/subfield/indicator is uniformly queryable, and it is lossless (the leader,
+indicators, and field/subfield order are all captured, so a record can be
+reconstructed exactly). See "Query the lake" for the query patterns.
 
 podlake uses ResourceSync rather than POD's OAI-PMH endpoint because the dump
 files are static downloads (fast, no server-side paging) and carry explicit,
@@ -114,11 +121,11 @@ keep the lake current.
 Deletions are explicit and durable in ResourceSync (POD publishes delete files),
 so no records linger after they are removed upstream.
 
-Syncing buffers records in memory per Parquet row group. Because the MARC schema
-is very wide, the default (`--batch-size 100000`) can use several GB of RAM on a
-large full dump; lower it on memory-constrained machines. Dumps are streamed and
-temporary files are cleaned up as each resource is processed, so peak disk use is
-roughly one resource at a time, not the whole chain:
+Syncing streams each dump and buffers records per Parquet row group
+(`--batch-size`, default 100000) — the tall schema keeps this light, but you can
+lower it on memory-constrained machines. Temporary files are cleaned up as each
+resource is processed, so peak disk use is roughly one resource at a time, not
+the whole chain:
 
 ```
 $ uvx podlake sync stanford --batch-size 10000
@@ -135,19 +142,18 @@ disk and stops there — no lake, no cursor, none of the load cost. Use
 $ uvx podlake fetch stanford ./out --full-only
 ```
 
-Each MARCXML resource becomes a `.parquet` in the output directory (delete files
-are copied as-is). This is handy for measuring things like column sparsity on
-real data.
+Each MARCXML resource becomes a `<name>.records.parquet` + `<name>.meta.parquet`
+pair in the output directory (delete files are copied as-is). This is handy for
+inspecting the converted data on real records.
 
 ## Load pre-built Parquet (optional)
 
-`sync` is the normal way to ingest. As an escape hatch, `load` ingests an
-existing Parquet file (or a directory of per-org files, using each file name as
-the organization) into the same `records` table:
+`sync` is the normal way to ingest. As an escape hatch, `load` ingests a
+records + meta Parquet pair produced by `fetch` (whole-org replace), finding the
+sibling `*.meta.parquet` and deriving the org from the filename prefix:
 
 ```
-$ uvx podlake load ./output/
-$ uvx podlake load stanford.parquet --org stanford
+$ uvx podlake load ./out/stanford-2026-02-11-full-marcxml.records.parquet
 ```
 
 Loading an organization that is already present replaces its rows, so `load` is
@@ -175,7 +181,7 @@ consumers attach.
 For a quick check you can query through podlake, which connects read-only:
 
 ```
-$ uvx podlake query "SELECT org, count(*) FROM records GROUP BY org"
+$ uvx podlake query "SELECT org, count(*) FROM record_meta GROUP BY org"
 ```
 
 Analysts typically connect directly with DuckDB. Attach the lake **read-only**
@@ -200,14 +206,47 @@ ATTACH 'ducklake:postgres:dbname=podlake host=your-db-host user=... password=...
   AS podlake (DATA_PATH 's3://your-bucket/lake/', READ_ONLY);
 USE podlake;
 
--- records per organization
-SELECT org, count(*) FROM records GROUP BY org;
+-- records per organization (record_meta = one row per record)
+SELECT org, count(*) FROM record_meta GROUP BY org;
 
 -- consortial overlap: works held by more than one institution
 SELECT goldrush_key, count(DISTINCT org) AS orgs
-FROM records
+FROM record_meta
 GROUP BY goldrush_key
 HAVING orgs > 1;
+```
+
+`records` is tall — one row per subfield — so query it accordingly. The columns
+are `org, pod_record_id, field_tag, field_seq, ind1, ind2, subfield_code,
+subfield_seq, value` (the leader is `field_tag='LDR'`; control fields have a
+NULL `subfield_code`).
+
+```sql
+-- all titles (245 $a)
+SELECT value FROM records WHERE field_tag='245' AND subfield_code='a';
+
+-- pull several fields per record as columns (conditional aggregation)
+SELECT pod_record_id,
+  max(value) FILTER (WHERE field_tag='245' AND subfield_code='a') AS title,
+  max(value) FILTER (WHERE field_tag='100' AND subfield_code='a') AS author
+FROM records
+WHERE field_tag IN ('245','100')
+GROUP BY pod_record_id;
+
+-- the same thing as a self-join, when you prefer it
+SELECT t.pod_record_id, t.value AS title, a.value AS author
+FROM records t JOIN records a USING (pod_record_id)
+WHERE t.field_tag='245' AND t.subfield_code='a'
+  AND a.field_tag='100' AND a.subfield_code='a';
+
+-- the whole 245 field (subfields joined in order)
+SELECT pod_record_id, string_agg(value, ' ' ORDER BY subfield_seq) AS field_245
+FROM records WHERE field_tag='245' GROUP BY pod_record_id, field_seq;
+
+-- reconstruct a record in order (leader first, then fields/subfields)
+SELECT field_tag, ind1, ind2, subfield_code, value
+FROM records WHERE pod_record_id = 'stanford:a1'
+ORDER BY field_seq, subfield_seq;
 ```
 
 The `OVERRIDE_DATA_PATH true` on the published-lake attach is needed because the
