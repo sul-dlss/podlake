@@ -11,6 +11,8 @@ a `record_meta` table with `goldrush_key`). It keeps the lake current with
 incremental syncs and can publish it to S3 for read-only consumers. See
 `README.md` for the user-facing workflow.
 
+Issues are tracked in **GitHub Issues** (https://github.com/sul-dlss/podlake/issues).
+
 ## Checks to run before opening or reviewing a PR
 
 Run all three and make sure they are clean, with no new warnings:
