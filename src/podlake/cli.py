@@ -171,20 +171,22 @@ def _sync_org(
                 suffix = ".xml.gz" if resource.url.endswith(".gz") else ".xml"
                 dl_path = Path(tmp) / f"resource{suffix}"
                 resourcesync.download(resource.url, dl_path, fixity=resource.fixity)
-                parquet_path = Path(tmp) / "resource.parquet"
+                records_pq = Path(tmp) / "records.parquet"
+                meta_pq = Path(tmp) / "meta.parquet"
                 with tqdm(
                     desc=f"{org} {resource.kind}", unit=" records", smoothing=0.01
                 ) as progress:
                     dump_to_parquet(
                         org,
                         dl_path,
-                        parquet_path,
+                        records_pq,
+                        meta_pq,
                         batch_size=batch_size,
                         on_record=lambda _: progress.update(1),
                         limit=limit,
                     )
                 changed, _ = lake.apply_resource(
-                    con, org, resource.kind, parquet_path, resource.lastmod
+                    con, org, resource.kind, (records_pq, meta_pq), resource.lastmod
                 )
                 total_changed += changed
     return total_changed, total_deleted, len(pending)
@@ -257,7 +259,8 @@ def _fetch_org(
             continue
 
         stem = name.removesuffix(".gz").removesuffix(".xml")
-        out = output_dir / f"{stem}.parquet"
+        records_out = output_dir / f"{stem}.records.parquet"
+        meta_out = output_dir / f"{stem}.meta.parquet"
         with tempfile.TemporaryDirectory() as tmp:
             suffix = ".xml.gz" if resource.url.endswith(".gz") else ".xml"
             dl_path = Path(tmp) / f"resource{suffix}"
@@ -268,56 +271,61 @@ def _fetch_org(
                 dump_to_parquet(
                     org,
                     dl_path,
-                    out,
+                    records_out,
+                    meta_out,
                     batch_size=batch_size,
                     on_record=lambda _: progress.update(1),
                     limit=limit,
                 )
-        total_bytes += out.stat().st_size
-        written += 1
+        total_bytes += records_out.stat().st_size + meta_out.stat().st_size
+        written += 2
 
     return written, total_bytes
 
 
 @app.command()
 def load(
-    path: Annotated[
+    records_parquet: Annotated[
         Path,
         typer.Argument(
-            help="A Parquet file, or a directory of per-org Parquet files",
-            exists=True,
+            help="A `*.records.parquet` file produced by `fetch`", exists=True
         ),
     ],
+    meta_parquet: Annotated[
+        Path | None,
+        typer.Option(
+            help="The matching meta Parquet (defaults to the sibling `*.meta.parquet`)"
+        ),
+    ] = None,
     org: Annotated[
         str | None,
-        typer.Option(
-            help="Organization name for a single Parquet file "
-            "(defaults to the file name without extension)"
-        ),
+        typer.Option(help="Organization name (defaults to the filename prefix)"),
     ] = None,
 ):
     """
-    Load an existing Parquet file (or a directory of per-org Parquet files) into
-    the unified `records` table, partitioned by org. Loading an org that already
-    exists replaces its rows, so this is safe to re-run. Most ingestion should
-    use `sync`; this is a manual escape hatch for pre-built Parquet.
+    Load a records + meta Parquet pair produced by `fetch` into the DuckLake,
+    replacing that org's rows (whole-org replace, so safe to re-run). Most
+    ingestion should use `sync`; this is a manual escape hatch for a fetched
+    full dump.
     """
     get_config()
 
-    if path.is_dir():
-        parquet_files = sorted(path.glob("*.parquet"))
-        if not parquet_files:
-            typer.echo(f"No .parquet files found in {path}", err=True)
-            raise typer.Exit(code=1)
-        jobs = [(p, p.stem) for p in parquet_files]
-    else:
-        jobs = [(path, org or path.stem)]
+    name = records_parquet.name
+    if ".records.parquet" not in name:
+        typer.echo("expected a `*.records.parquet` file", err=True)
+        raise typer.Exit(code=1)
+    meta = meta_parquet or records_parquet.with_name(
+        name.replace(".records.parquet", ".meta.parquet")
+    )
+    if not meta.is_file():
+        typer.echo(f"meta Parquet not found: {meta}", err=True)
+        raise typer.Exit(code=1)
+    org_name = org or name.split("-")[0]
 
     con = lake.connect(read_only=False)
     try:
-        for parquet_path, org_name in jobs:
-            count = lake.load_parquet(con, parquet_path, org_name)
-            print(f"loaded [bold]{count}[/bold] records for {org_name}")
+        count = lake.load_pair(con, org_name, records_parquet, meta)
+        print(f"loaded [bold]{count}[/bold] records for {org_name}")
     finally:
         con.close()
 

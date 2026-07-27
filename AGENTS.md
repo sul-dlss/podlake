@@ -5,10 +5,11 @@ Guidance for agents (and humans) working in podlake.
 ## What podlake is
 
 A command-line tool that syncs MARC XML from POD's ResourceSync service (full
-dump + daily deltas + delete files), converts it to Parquet with marctable,
-loads it into a DuckLake store, keeps it current with incremental syncs, and can
-publish it to S3 for read-only consumers. See `README.md` for the user-facing
-workflow.
+dump + daily deltas + delete files), parses it with pymarc/lxml, and loads it
+into a DuckLake store as a tall/EAV `records` table (one row per subfield, plus
+a `record_meta` table with `goldrush_key`). It keeps the lake current with
+incremental syncs and can publish it to S3 for read-only consumers. See
+`README.md` for the user-facing workflow.
 
 ## Checks to run before opening or reviewing a PR
 
@@ -52,6 +53,8 @@ Also worth checking:
 - **Build hygiene.** ruff/ty/pytest clean, no new warnings.
 - **Spec adherence.** Follow the conventions of the systems podlake bridges:
   ResourceSync (capability/resource lists, full vs delta dumps, delete files,
-  processing resources in `lastmod` order), MARC / MARCXML (control vs data
-  fields, the 001 as record id), and DuckLake (snapshots, partitioning,
-  merge-on-read delete files, read-only attach).
+  processing resources in `lastmod` order), MARC / MARCXML (leader, control vs
+  data fields, indicators, the 001 as record id; the EAV `records` schema is
+  meant to be lossless — preserve field/subfield order via `field_seq`/
+  `subfield_seq`), and DuckLake (snapshots, partitioning, merge-on-read delete
+  files, read-only attach).

@@ -10,6 +10,7 @@ from podlake.storage import Storage
 logger = logging.getLogger(__name__)
 
 RECORDS_TABLE = "records"
+META_TABLE = "record_meta"
 STATE_TABLE = "harvest_state"
 
 
@@ -35,53 +36,65 @@ def connect(
     return con
 
 
-def ensure_schema(con: duckdb.DuckDBPyConnection, columns: list[str]) -> None:
+def ensure_schema(con: duckdb.DuckDBPyConnection) -> None:
     """
-    Create the unified `records` table (partitioned by org) if it does not yet
-    exist. `columns` is the ordered list of Parquet column names produced by the
-    conversion step; every one is stored as VARCHAR, matching marctable output.
-    An `org` column is prepended as the partition key.
+    Create the tall `records` (EAV) table and the per-record `record_meta`
+    table if they don't exist yet, each partitioned by org. The schema is fixed
+    (see convert.RECORDS_SCHEMA / META_SCHEMA), so no column derivation is
+    needed.
     """
-    existing = con.execute(
-        "SELECT table_name FROM information_schema.tables "
-        f"WHERE table_name = '{RECORDS_TABLE}'"
-    ).fetchall()
-    if existing:
+    if _table_exists(con, RECORDS_TABLE):
         return
 
-    col_defs = ", ".join(f"{_quote_ident(name)} VARCHAR" for name in columns)
     con.execute(
-        f"CREATE TABLE {RECORDS_TABLE} ({_quote_ident('org')} VARCHAR, {col_defs})"
+        f"CREATE TABLE {RECORDS_TABLE} ("
+        "org VARCHAR, pod_record_id VARCHAR, field_tag VARCHAR, field_seq INTEGER, "
+        "ind1 VARCHAR, ind2 VARCHAR, subfield_code VARCHAR, subfield_seq INTEGER, "
+        "value VARCHAR)"
     )
     con.execute(f"ALTER TABLE {RECORDS_TABLE} SET PARTITIONED BY (org)")
-    logger.info("created %s table partitioned by org", RECORDS_TABLE)
+
+    con.execute(
+        f"CREATE TABLE {META_TABLE} "
+        "(org VARCHAR, pod_record_id VARCHAR, goldrush_key VARCHAR)"
+    )
+    con.execute(f"ALTER TABLE {META_TABLE} SET PARTITIONED BY (org)")
+    logger.info("created %s + %s tables partitioned by org", RECORDS_TABLE, META_TABLE)
 
 
-def load_parquet(con: duckdb.DuckDBPyConnection, parquet_path: Path, org: str) -> int:
+def load_pair(
+    con: duckdb.DuckDBPyConnection,
+    org: str,
+    records_parquet: Path,
+    meta_parquet: Path,
+) -> int:
     """
-    Load a single organization's Parquet file into the `records` table,
-    replacing any existing rows for that org. Returns the number of rows loaded.
-
-    The Parquet files produced by the conversion step have no `org` column, so
-    it is added here from the supplied org name. This is idempotent: loading the
-    same org again replaces its rows rather than duplicating them.
+    Load one organization's records + meta Parquet pair, replacing any existing
+    rows for that org (idempotent). Returns the number of records loaded.
     """
-    columns = _parquet_columns(con, parquet_path)
-    ensure_schema(con, columns)
+    ensure_schema(con)
 
     con.execute("BEGIN TRANSACTION")
     try:
         con.execute(f"DELETE FROM {RECORDS_TABLE} WHERE org = ?", [org])
-        _insert_parquet(con, org, parquet_path, columns)
+        con.execute(f"DELETE FROM {META_TABLE} WHERE org = ?", [org])
+        con.execute(
+            f"INSERT INTO {RECORDS_TABLE} SELECT * FROM read_parquet(?)",
+            [str(records_parquet)],
+        )
+        con.execute(
+            f"INSERT INTO {META_TABLE} SELECT * FROM read_parquet(?)",
+            [str(meta_parquet)],
+        )
         con.execute("COMMIT")
     except Exception:
         con.execute("ROLLBACK")
         raise
 
-    count = con.execute(
-        f"SELECT count(*) FROM {RECORDS_TABLE} WHERE org = ?", [org]
+    row = con.execute(
+        f"SELECT count(*) FROM {META_TABLE} WHERE org = ?", [org]
     ).fetchone()
-    loaded = count[0] if count else 0
+    loaded = row[0] if row else 0
     logger.info("loaded %s records for org=%s", loaded, org)
     return loaded
 
@@ -115,19 +128,6 @@ def get_cursor(con: duckdb.DuckDBPyConnection, org: str) -> datetime | None:
     return row[0].replace(tzinfo=UTC)
 
 
-def set_cursor(
-    con: duckdb.DuckDBPyConnection, org: str, last_modified: datetime
-) -> None:
-    ensure_state_table(con)
-    con.execute("BEGIN TRANSACTION")
-    try:
-        _set_cursor(con, org, last_modified)
-        con.execute("COMMIT")
-    except Exception:
-        con.execute("ROLLBACK")
-        raise
-
-
 def _set_cursor(
     con: duckdb.DuckDBPyConnection, org: str, last_modified: datetime
 ) -> None:
@@ -148,46 +148,62 @@ def apply_resource(
     con: duckdb.DuckDBPyConnection,
     org: str,
     kind: str,
-    payload: Path | list[str],
+    payload: tuple[Path, Path] | list[str],
     last_modified: datetime,
 ) -> tuple[int, int]:
     """
     Apply one ResourceSync resource for an org in a single transaction (one
     DuckLake snapshot), then advance the org's sync cursor to `last_modified`:
 
-    - "full"/"delta": `payload` is a Parquet path; upsert its records by
-      pod_record_id (delete existing ids, insert the new versions).
-    - "deletes": `payload` is a list of pod_record_ids to delete.
+    - "full"/"delta": `payload` is a (records_parquet, meta_parquet) pair; upsert
+      the records by pod_record_id (delete existing ids from both tables, insert
+      the new versions).
+    - "deletes": `payload` is a list of pod_record_ids to delete from both tables.
 
     Returns (changed_count, deleted_count).
     """
+    ensure_schema(con)
     ensure_state_table(con)
 
     changed_count = deleted_count = 0
     con.execute("BEGIN TRANSACTION")
     try:
         if kind in ("full", "delta"):
-            assert isinstance(payload, Path)
-            columns = _parquet_columns(con, payload)
-            ensure_schema(con, columns)
+            assert isinstance(payload, tuple)
+            records_pq, meta_pq = payload
+            # incoming ids come from meta (one row per record)
+            ids_subquery = "(SELECT pod_record_id FROM read_parquet(?))"
             con.execute(
-                f"DELETE FROM {RECORDS_TABLE} WHERE pod_record_id IN "
-                "(SELECT pod_record_id FROM read_parquet(?))",
-                [str(payload)],
+                f"DELETE FROM {RECORDS_TABLE} WHERE pod_record_id IN {ids_subquery}",
+                [str(meta_pq)],
             )
-            _insert_parquet(con, org, payload, columns)
+            con.execute(
+                f"DELETE FROM {META_TABLE} WHERE pod_record_id IN {ids_subquery}",
+                [str(meta_pq)],
+            )
+            con.execute(
+                f"INSERT INTO {RECORDS_TABLE} SELECT * FROM read_parquet(?)",
+                [str(records_pq)],
+            )
+            con.execute(
+                f"INSERT INTO {META_TABLE} SELECT * FROM read_parquet(?)",
+                [str(meta_pq)],
+            )
             row = con.execute(
-                "SELECT count(*) FROM read_parquet(?)", [str(payload)]
+                "SELECT count(*) FROM read_parquet(?)", [str(meta_pq)]
             ).fetchone()
             changed_count = row[0] if row else 0
         elif kind == "deletes":
             assert isinstance(payload, list)
-            # A deletes resource can precede any data (nothing to delete yet).
-            if payload and _table_exists(con, RECORDS_TABLE):
+            if payload:
                 placeholders = ", ".join("?" for _ in payload)
                 con.execute(
                     f"DELETE FROM {RECORDS_TABLE} "
                     f"WHERE pod_record_id IN ({placeholders})",
+                    payload,
+                )
+                con.execute(
+                    f"DELETE FROM {META_TABLE} WHERE pod_record_id IN ({placeholders})",
                     payload,
                 )
                 deleted_count = len(payload)
@@ -237,37 +253,6 @@ def publish(config: Config, dest_uri: str) -> tuple[str, str, int]:
 
     logger.info("published %s + %s data files to %s", catalog_key, data_files, dest_uri)
     return catalog_key, data_prefix, data_files + 1
-
-
-def _insert_parquet(
-    con: duckdb.DuckDBPyConnection,
-    org: str,
-    parquet_path: Path,
-    columns: list[str],
-) -> None:
-    """
-    Insert every row of a Parquet file into `records`, prepending the org
-    partition column. Shared by the full-load and incremental-update paths.
-    """
-    select_cols = ", ".join(_quote_ident(name) for name in columns)
-    con.execute(
-        f"INSERT INTO {RECORDS_TABLE} "
-        f"SELECT ? AS org, {select_cols} FROM read_parquet(?)",
-        [org, str(parquet_path)],
-    )
-
-
-def _quote_ident(name: str) -> str:
-    # Column names come from the Parquet schema (marctable's fixed field/subfield
-    # set), so they are trusted, but quote-escape defensively since identifiers
-    # can't be passed as bind parameters.
-    escaped = name.replace('"', '""')
-    return f'"{escaped}"'
-
-
-def _parquet_columns(con: duckdb.DuckDBPyConnection, parquet_path: Path) -> list[str]:
-    rel = con.execute("SELECT * FROM read_parquet(?) LIMIT 0", [str(parquet_path)])
-    return [description[0] for description in rel.description]
 
 
 def _table_exists(con: duckdb.DuckDBPyConnection, name: str) -> bool:
