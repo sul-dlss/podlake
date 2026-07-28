@@ -244,7 +244,7 @@ def test_read_only_cannot_write(tmp_path):
     reader.close()
 
 
-def test_publish_uploads_catalog(tmp_path):
+def test_publish_incremental(tmp_path):
     config = _dev_config(tmp_path)
     rpq, mpq = _write_org(tmp_path, "stanford", [_record("stanford", "a1", "T", "k")])
     con = lake.connect(read_only=False, config=config)
@@ -257,13 +257,27 @@ def test_publish_uploads_catalog(tmp_path):
     with moto.mock_aws():
         s3 = boto3.client("s3")
         s3.create_bucket(Bucket="pod-public")
-        catalog_key, _, count = lake.publish(config, "s3://pod-public/lake")
-        assert count >= 1
+
+        # first publish uploads the catalog (+ any non-inlined data files; a
+        # tiny lake gets inlined into the catalog, so there may be none)
+        catalog_key, _, uploaded, _ = lake.publish(config, "s3://pod-public/lake")
         keys = [
             o["Key"]
             for o in s3.list_objects_v2(Bucket="pod-public").get("Contents", [])
         ]
         assert f"lake/{catalog_key}" in keys
+
+        # re-publish is idempotent: no new uploads, prior data skipped, catalog
+        # re-uploaded (file-level skip mechanics are covered in test_storage)
+        catalog_key2, _, uploaded2, skipped2 = lake.publish(
+            config, "s3://pod-public/lake"
+        )
+        assert uploaded2 == 0
+        assert skipped2 == uploaded
+        assert f"lake/{catalog_key2}" in [
+            o["Key"]
+            for o in s3.list_objects_v2(Bucket="pod-public").get("Contents", [])
+        ]
 
 
 def test_publish_rejects_postgres_catalog(tmp_path):

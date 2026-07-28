@@ -162,10 +162,11 @@ safe to re-run.
 ## Publish for read-only consumers
 
 To share the lake with other institutions read-only, maintain it locally with
-the `development` profile and publish it to an S3 bucket. `publish` uploads the
-catalog file and all Parquet data, so consumers can attach to it over `s3://`
-with no database to reach — a good fit for a periodically-updated public
-dataset:
+the `development` profile and publish it to an S3 bucket. `publish` incrementally
+syncs the Parquet data (skipping files already in the bucket) and uploads the
+catalog, so consumers can attach to it over `s3://` with no database to reach —
+a good fit for a periodically-updated public dataset. Re-running after a daily
+sync uploads only the new files:
 
 ```
 $ uvx podlake publish s3://your-bucket/pod   # or set PODLAKE_PUBLISH_URL

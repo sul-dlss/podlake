@@ -359,7 +359,8 @@ def publish(
 ):
     """
     Publish a file-catalog lake to an S3 bucket so read-only consumers can
-    attach to it over s3://. Uploads the catalog file and all Parquet data.
+    attach to it over s3://. Incrementally syncs new/changed Parquet data (skips
+    files already in the bucket) and uploads the catalog.
     """
     cfg = get_config()
 
@@ -376,8 +377,11 @@ def publish(
         )
         raise typer.Exit(code=1)
 
-    catalog_key, data_prefix, count = lake.publish(cfg, target)
-    print(f"published [bold]{count}[/bold] files to {target}")
+    catalog_key, data_prefix, uploaded, skipped = lake.publish(cfg, target)
+    print(
+        f"published to {target}: [bold]{uploaded}[/bold] data files uploaded, "
+        f"{skipped} unchanged skipped (+ catalog)"
+    )
 
     base = target.rstrip("/")
     print("\nConsumers can attach read-only with:")
