@@ -49,9 +49,9 @@ def test_sync_dir_preserves_structure(tmp_path, test_bucket, s3):
     (tmp_path / "lake-data" / "top.txt").write_bytes(b"T")
 
     storage = Storage(f"s3://{test_bucket_name}/pod")
-    count = storage.sync_dir(tmp_path / "lake-data", "lake-data")
+    uploaded, skipped = storage.sync_dir(tmp_path / "lake-data", "lake-data")
 
-    assert count == 2
+    assert (uploaded, skipped) == (2, 0)
     keys = sorted(
         o["Key"] for o in s3.list_objects_v2(Bucket=test_bucket_name)["Contents"]
     )
@@ -61,9 +61,36 @@ def test_sync_dir_preserves_structure(tmp_path, test_bucket, s3):
     ]
 
 
+def test_sync_dir_incremental(tmp_path, test_bucket):
+    data = tmp_path / "lake-data"
+    (data / "main").mkdir(parents=True)
+    (data / "main" / "a.parquet").write_bytes(b"AAAA")
+    (data / "main" / "b.parquet").write_bytes(b"BBBB")
+    storage = Storage(f"s3://{test_bucket_name}/pod")
+
+    # first sync uploads both
+    assert storage.sync_dir(data, "lake-data") == (2, 0)
+    # unchanged re-sync uploads nothing
+    assert storage.sync_dir(data, "lake-data") == (0, 2)
+    # a changed (different-size) file is re-uploaded; a new file is uploaded
+    (data / "main" / "a.parquet").write_bytes(b"AAAA-longer")
+    (data / "main" / "c.parquet").write_bytes(b"CCCC")
+    assert storage.sync_dir(data, "lake-data") == (2, 1)
+
+
+def test_existing_objects(tmp_path, test_bucket):
+    storage = Storage(f"s3://{test_bucket_name}/pod")
+    f = tmp_path / "x.parquet"
+    f.write_bytes(b"12345")
+    storage.upload_file(f, "lake-data/x.parquet")
+
+    existing = storage.existing_objects("lake-data")
+    assert existing == {"pod/lake-data/x.parquet": 5}
+
+
 def test_sync_dir_missing_directory_is_noop(tmp_path, test_bucket):
     storage = Storage(f"s3://{test_bucket_name}")
-    assert storage.sync_dir(tmp_path / "does-not-exist") == 0
+    assert storage.sync_dir(tmp_path / "does-not-exist") == (0, 0)
 
 
 def test_bad_uri_rejected():

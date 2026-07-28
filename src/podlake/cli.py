@@ -376,8 +376,11 @@ def publish(
         )
         raise typer.Exit(code=1)
 
-    catalog_key, data_prefix, count = lake.publish(cfg, target)
-    print(f"published [bold]{count}[/bold] files to {target}")
+    catalog_key, data_prefix, uploaded, skipped = lake.publish(cfg, target)
+    print(
+        f"published to {target}: [bold]{uploaded}[/bold] data files uploaded, "
+        f"{skipped} unchanged skipped (+ catalog)"
+    )
 
     base = target.rstrip("/")
     print("\nConsumers can attach read-only with:")

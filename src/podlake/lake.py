@@ -226,14 +226,17 @@ def apply_resource(
     return changed_count, deleted_count
 
 
-def publish(config: Config, dest_uri: str) -> tuple[str, str, int]:
+def publish(config: Config, dest_uri: str) -> tuple[str, str, int, int]:
     """
     Publish a file-catalog lake to an S3 bucket so read-only consumers can
-    attach to it over s3://. Uploads the catalog file and every Parquet data
-    file under DATA_PATH. Returns (catalog_key, data_prefix, files_uploaded).
+    attach to it over s3://. Incrementally syncs the Parquet data under
+    DATA_PATH (only new/changed files) and then uploads the catalog. Returns
+    (catalog_key, data_prefix, uploaded, skipped).
 
-    Consumers attach with the catalog and data at their published locations,
-    passing OVERRIDE_DATA_PATH because the catalog was written with a local
+    Data files are uploaded **before** the catalog so the published catalog only
+    ever references files already present; DuckLake snapshot isolation keeps
+    readers on the prior snapshot until the new catalog lands. Consumers attach
+    with OVERRIDE_DATA_PATH because the catalog was written with a local
     DATA_PATH.
     """
     if not config.is_file_catalog:
@@ -248,11 +251,18 @@ def publish(config: Config, dest_uri: str) -> tuple[str, str, int]:
     catalog_key = catalog_path.name
 
     storage = Storage(dest_uri)
+    # data first (immutable, additive; skips what's already uploaded)...
+    uploaded, skipped = storage.sync_dir(data_path, data_prefix)
+    # ...then the catalog last (it changes every publish).
     storage.upload_file(catalog_path, catalog_key)
-    data_files = storage.sync_dir(data_path, data_prefix)
 
-    logger.info("published %s + %s data files to %s", catalog_key, data_files, dest_uri)
-    return catalog_key, data_prefix, data_files + 1
+    logger.info(
+        "published to %s: %s data files uploaded, %s skipped (+ catalog)",
+        dest_uri,
+        uploaded,
+        skipped,
+    )
+    return catalog_key, data_prefix, uploaded, skipped
 
 
 def _table_exists(con: duckdb.DuckDBPyConnection, name: str) -> bool:

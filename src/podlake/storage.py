@@ -30,22 +30,39 @@ class Storage:
         logger.info(f"uploading {path} to s3://{self.bucket_name}/{full_key}")
         self.bucket.upload_file(str(path), full_key)
 
-    def sync_dir(self, local_dir: Path, key_prefix: str = "") -> int:
+    def sync_dir(self, local_dir: Path, key_prefix: str = "") -> tuple[int, int]:
         """
-        Upload every file under local_dir to the bucket, preserving the
-        directory structure under key_prefix. Returns the number of files
-        uploaded.
+        Sync every file under local_dir to the bucket, preserving the directory
+        structure under key_prefix. Skips files already present in the bucket
+        with the same size (DuckLake data/delete files are immutable and
+        uniquely named, so a matching key+size means it's already uploaded; the
+        size check re-uploads anything left truncated by an interrupted publish).
+        Returns (uploaded, skipped).
         """
         if not local_dir.is_dir():
-            return 0
-        count = 0
+            return 0, 0
+
+        existing = self.existing_objects(key_prefix)
+        uploaded = skipped = 0
         for path in sorted(local_dir.rglob("*")):
-            if path.is_file():
-                rel = path.relative_to(local_dir).as_posix()
-                key = f"{key_prefix}/{rel}" if key_prefix else rel
-                self.upload_file(path, key)
-                count += 1
-        return count
+            if not path.is_file():
+                continue
+            rel = path.relative_to(local_dir).as_posix()
+            key = f"{key_prefix}/{rel}" if key_prefix else rel
+            if existing.get(self._full_key(key)) == path.stat().st_size:
+                skipped += 1
+                continue
+            self.upload_file(path, key)
+            uploaded += 1
+        return uploaded, skipped
+
+    def existing_objects(self, key_prefix: str = "") -> dict[str, int]:
+        """
+        Return {full_key: size} for every object already in the bucket under
+        key_prefix, so a sync can skip files that are already uploaded.
+        """
+        prefix = self._full_key(key_prefix) if key_prefix else self.prefix
+        return {obj.key: obj.size for obj in self.bucket.objects.filter(Prefix=prefix)}
 
     def _full_key(self, key: str) -> str:
         return f"{self.prefix}/{key}" if self.prefix else key
