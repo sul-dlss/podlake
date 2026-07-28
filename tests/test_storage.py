@@ -88,6 +88,19 @@ def test_existing_objects(tmp_path, test_bucket):
     assert existing == {"pod/lake-data/x.parquet": 5}
 
 
+def test_existing_objects_respects_path_boundary(tmp_path, test_bucket):
+    storage = Storage(f"s3://{test_bucket_name}/pod")
+    under = tmp_path / "u.parquet"
+    under.write_bytes(b"12345")
+    storage.upload_file(under, "lake-data/u.parquet")
+    sibling = tmp_path / "s.parquet"
+    sibling.write_bytes(b"99")
+    storage.upload_file(sibling, "lake-data-old/s.parquet")
+
+    # "lake-data" must not match the "lake-data-old" sibling
+    assert storage.existing_objects("lake-data") == {"pod/lake-data/u.parquet": 5}
+
+
 def test_sync_dir_missing_directory_is_noop(tmp_path, test_bucket):
     storage = Storage(f"s3://{test_bucket_name}")
     assert storage.sync_dir(tmp_path / "does-not-exist") == (0, 0)

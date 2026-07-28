@@ -62,6 +62,10 @@ class Storage:
         key_prefix, so a sync can skip files that are already uploaded.
         """
         prefix = self._full_key(key_prefix) if key_prefix else self.prefix
+        # match on the path boundary so a sibling like "<prefix>-old/..." can't
+        # match a "<prefix>/..." listing (S3 Prefix is a raw string match)
+        if prefix and not prefix.endswith("/"):
+            prefix += "/"
         return {obj.key: obj.size for obj in self.bucket.objects.filter(Prefix=prefix)}
 
     def _full_key(self, key: str) -> str:

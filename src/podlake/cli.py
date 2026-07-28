@@ -359,7 +359,8 @@ def publish(
 ):
     """
     Publish a file-catalog lake to an S3 bucket so read-only consumers can
-    attach to it over s3://. Uploads the catalog file and all Parquet data.
+    attach to it over s3://. Incrementally syncs new/changed Parquet data (skips
+    files already in the bucket) and uploads the catalog.
     """
     cfg = get_config()
 
