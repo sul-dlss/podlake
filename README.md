@@ -2,39 +2,119 @@
 
 [![Tests](https://github.com/sul-dlss/podlake/actions/workflows/test.yml/badge.svg)](https://github.com/sul-dlss/podlake/actions/workflows/test.yml)
 
-podlake syncs MARC XML data from [POD]'s [ResourceSync] service, converts it to
-Parquet with [marctable], and loads it into a [DuckLake] lakehouse so it can be
-queried with DuckDB.
+podlake harvests MARC from [POD]'s [ResourceSync] service, converts it to
+Parquet, and loads it into a [DuckLake] lakehouse so it can be queried with
+DuckDB. The lake is only ever as current as POD's most recently published delta.
 
-DuckLake is a DuckDB-centric table format: today you query it with DuckDB (the
-`ducklake` extension). The data files are ordinary Parquet, but reading them
-directly with another tool bypasses the DuckLake catalog — its snapshots and
-merge-on-read delete files — and would return incorrect results after updates,
-so use a DuckLake-aware client. Multi-engine access (Spark, Trino/Athena) is on
-DuckLake's roadmap but not yet practical; if you need that today, Iceberg is the
-better-supported format.
+## The DuckLake schema
 
-The data flows in two steps:
+[DuckLake] is a DuckDB-centric table format: a catalog plus ordinary Parquet
+data files. DuckLake handles record updates and deletes for you so you will
+always get the most recent record. You query it with DuckDB (the `ducklake`
+extension), instead of reading the Parquet files directly.
 
-1. **sync** — `podlake sync` / `sync-all` download POD's ResourceSync dump files
-   (a base full dump plus a chain of daily delta and delete files), convert them
-   to Parquet, and upsert them into DuckLake. MARC is stored in a tall
-   `records` table — **one row per subfield** — plus a small `record_meta` table
-   (one row per record, with `goldrush_key`), both partitioned by organization.
-2. **query** — analysts attach to the DuckLake read-only and run SQL.
+Once you connect to the DuckLake you will see two tables, both partitioned by
+`org` (the contributing institution).
 
-The tall (EAV) `records` layout is deliberate: it loads into DuckLake orders of
-magnitude faster and cheaper than a wide one-column-per-field table, every MARC
-field/subfield/indicator is uniformly queryable, and it is lossless (the leader,
-indicators, and field/subfield order are all captured, so a record can be
-reconstructed exactly). See "Query the lake" for the query patterns.
+**`record_meta` — one row per record**
 
-podlake uses ResourceSync rather than POD's OAI-PMH endpoint because the dump
-files are static downloads (fast, no server-side paging) and carry explicit,
-durable deletions. A consequence is that the lake is only as current as POD's
-most recently published delta.
+| column | type | notes |
+| --- | --- | --- |
+| `org` | VARCHAR | contributing institution (partition key) |
+| `pod_record_id` | VARCHAR | stable record id, `org:localid` |
+| `goldrush_key` | VARCHAR | Gold Rush match key; groups records into distinct titles |
 
-## Install
+**`records` — one row per subfield (tall / EAV)**
+
+| column | type | notes |
+| --- | --- | --- |
+| `org` | VARCHAR | partition key |
+| `pod_record_id` | VARCHAR | joins to `record_meta` |
+| `field_tag` | VARCHAR | MARC tag; the leader is `'LDR'` |
+| `field_seq` | INTEGER | field order within the record |
+| `ind1`, `ind2` | VARCHAR | indicators (NULL for control fields) |
+| `subfield_code` | VARCHAR | subfield code; NULL for control fields / leader |
+| `subfield_seq` | INTEGER | subfield order within the field |
+| `value` | VARCHAR | the subfield text (or the control-field / leader string) |
+
+Notes for querying:
+
+- The leader is `field_tag = 'LDR'`; control fields (00X) hold their data in
+  `value` with a NULL `subfield_code`.
+- Field and subfield order is preserved by `field_seq` / `subfield_seq`, so a
+  record round-trips exactly.
+- Handy 008 slices (1-indexed): publication year = `substr(value, 8, 4)`, place
+  of publication = chars 16–18, language = 36–38; leader type-of-record = char 7.
+
+(podlake also keeps a small internal `harvest_state` table — the per-org sync
+cursor — which you don't normally query.)
+
+This tall, one-row-per-subfield layout is deliberate, and follows the
+MARC-in-Parquet format research in [`dchud/mrrc`][mrrc]: it loads into DuckLake
+orders of magnitude faster and cheaper than a wide one-column-per-field table,
+every field/subfield/indicator is uniformly queryable with a plain `WHERE`, and
+it's lossless. As that evaluation observes, columnar storage pays off for very
+large analytic collections — which is exactly podlake's case.
+
+### Gold Rush keys
+
+Every `record_meta` row carries a `goldrush_key`: a normalized key produced by
+the Colorado Alliance's [Gold Rush match key][goldrush] algorithm, derived from a
+record's title, author, publication year, edition, publisher, pagination,
+material type, and carrier. Records that produce the same key describe the same
+title, so the key is how you work at the *title* level across the consortium —
+`GROUP BY goldrush_key` collapses many institutions' records for one title into a
+single group, and `count(DISTINCT org)` per key is how many institutions hold it
+(the basis for overlap, rarity / "last copies", and deduplication). It is roughly
+*manifestation*-level: because it captures edition and carrier, a print book and
+its e-book edition get distinct keys and won't group together.
+
+### Example queries
+
+```sql
+-- records vs. distinct titles per organization
+SELECT org, count(*) AS records, count(DISTINCT goldrush_key) AS titles
+FROM record_meta GROUP BY org;
+
+-- consortial overlap: titles held by more than one institution
+SELECT goldrush_key, count(DISTINCT org) AS orgs
+FROM record_meta GROUP BY goldrush_key HAVING orgs > 1;
+
+-- all titles (245 $a)
+SELECT value FROM records WHERE field_tag = '245' AND subfield_code = 'a';
+
+-- pull several fields per record as columns (conditional aggregation)
+SELECT pod_record_id,
+  max(value) FILTER (WHERE field_tag = '245' AND subfield_code = 'a') AS title,
+  max(value) FILTER (WHERE field_tag = '100' AND subfield_code = 'a') AS author
+FROM records WHERE field_tag IN ('245', '100') GROUP BY pod_record_id;
+
+-- reconstruct a record in order (leader first, then fields/subfields)
+SELECT field_tag, ind1, ind2, subfield_code, value
+FROM records WHERE pod_record_id = 'stanford:a1'
+ORDER BY field_seq, subfield_seq;
+```
+
+### Joining fields and subfields
+
+Because each subfield is its own row, you relate them with a **self-join** on
+`records`. Join on `pod_record_id` to combine different fields of a record; join
+on `(pod_record_id, field_seq)` to combine subfields of the *same* field
+occurrence — something `FILTER`-aggregation can't distinguish when a field
+repeats:
+
+```sql
+-- title ($a) paired with the remainder-of-title ($b) from the same 245
+SELECT a.pod_record_id, a.value AS title, b.value AS remainder
+FROM records a JOIN records b USING (pod_record_id, field_seq)
+WHERE a.field_tag = '245' AND a.subfield_code = 'a' AND b.subfield_code = 'b';
+```
+
+The `FILTER (WHERE …)` form shown above is simpler when you just want one value
+per field per record; reach for a self-join when a field can repeat (multiple
+650s, 856s, …) or when you need to correlate subfields within a single field.
+
+## Building the lake
 
 Install [uv], then run podlake with `uvx`:
 
@@ -42,151 +122,69 @@ Install [uv], then run podlake with `uvx`:
 $ uvx podlake --help
 ```
 
-## Configure
-
-podlake is configured with environment variables, which it reads from a `.env`
-file in the current directory (or the real environment). Copy the token you use
-for POD into `PODBUCKET_POD_TOKEN`, then choose a profile with `PODLAKE_ENV`.
-
-There are two profiles:
-
-**`development` (default)** — a local DuckDB catalog file and local Parquet.
-Nothing external is required, so it's ideal for experimenting. It's also the
-profile you use to maintain a lake locally and then `publish` it to S3 for
-read-only consumers (see below):
+Configure it with environment variables (read from a `.env` file or the
+environment): put your POD token in `PODBUCKET_POD_TOKEN` and pick a profile with
+`PODLAKE_ENV`. The default **`development`** profile uses a local catalog file
+and local Parquet — ideal for building a lake locally and then publishing it:
 
 ```sh
 PODBUCKET_POD_TOKEN=your-pod-token
 PODLAKE_ENV=development
 PODLAKE_CATALOG=podlake.ducklake         # local catalog file (default)
 PODLAKE_DATA_PATH=./lake-data/           # where Parquet data files live (default)
-PODLAKE_PUBLISH_URL=s3://your-bucket/pod # optional: default target for `publish`
+PODLAKE_PUBLISH_URL=s3://your-bucket/pod # optional default target for `publish`
 ```
 
-**`production`** — a Postgres catalog and an S3 data path, for a shared lake
-that many analysts can query and write *concurrently*. Most read-only sharing
-does not need this — prefer the `publish` workflow below unless you need
-concurrent writers or many-times-a-day live updates:
+In production you run that same `development` profile on a server, `sync`, and
+`publish` the file-catalog lake to S3 (below); POD members then attach to the
+bucket read-only, with no database to run or expose. This suits a periodically
+updated, read-mostly, widely-shared lake — the catalog is a small file in the
+bucket, and S3 fans out to many readers far more easily than a database
+connection would. (A Postgres-catalog **`production`** profile also exists, but
+it's only worth the operational overhead for a lake with *concurrent writers* or
+many-times-a-day live updates — not for read-only sharing.) Confirm the resolved
+profile with `uvx podlake config`.
 
-```sh
-PODBUCKET_POD_TOKEN=your-pod-token
-PODLAKE_ENV=production
-PODLAKE_DATA_PATH=s3://your-bucket/lake/
-PODLAKE_PG_HOST=your-db-host
-PODLAKE_PG_DBNAME=podlake
-PODLAKE_PG_USER=podlake
-PODLAKE_PG_PASSWORD=...
-# or, instead of the PODLAKE_PG_* vars, a single DSN:
-# PODLAKE_PG_DSN=host=... dbname=podlake user=podlake password=...
-
-# AWS credentials for S3 are resolved by DuckDB's credential_chain, i.e. the
-# standard AWS_* environment variables, your shared config, or an assumed role.
-AWS_ACCESS_KEY_ID=...
-AWS_SECRET_ACCESS_KEY=...
-AWS_DEFAULT_REGION=us-west-2
-```
-
-Check the resolved profile and confirm podlake can reach the lake:
+**Sync** downloads POD's ResourceSync dumps (a base full dump plus a chain of
+daily delta and delete files), converts them to Parquet, and upserts them into
+the lake:
 
 ```
-$ uvx podlake config
-```
-
-## Sync from POD
-
-List the organizations (ResourceSync streams) available, with how many resources
-(full dump + deltas + deletes) each has and their total download size:
-
-```
-$ uvx podlake streams
-```
-
-Sync an organization into the DuckLake:
-
-```
+$ uvx podlake streams            # list organizations + their resource counts/sizes
 $ uvx podlake sync stanford      # one organization
 $ uvx podlake sync-all           # every organization, one at a time
 ```
 
-`sync` processes every ResourceSync resource newer than the org's cursor, in
-chronological order: the base full dump, then each daily delta (upserted into
-`records` by `pod_record_id`) and delete file (removed). The **first run does
-the full initial load; later runs apply only new deltas** — one command for both.
-Each resource is applied in its own transaction (one DuckLake snapshot) and
-advances the org's cursor (stored in the lake's `harvest_state` table), so an
-interrupted `sync` resumes cleanly from where it left off. Run `sync-all` on a
-schedule (cron, a systemd timer, a Kubernetes CronJob, or GitHub Actions) to
-keep the lake current.
+The **first run does the full initial load; later runs apply only new deltas** —
+one command for both. Each resource is applied in its own transaction (one
+DuckLake snapshot) and advances the org's cursor, so an interrupted sync resumes
+cleanly. Run `sync-all` on a schedule (cron, a systemd timer, a Kubernetes
+CronJob, GitHub Actions) to keep the lake current. Lower `--batch-size` (default
+100000) on memory-constrained machines.
 
-Deletions are explicit and durable in ResourceSync (POD publishes delete files),
-so no records linger after they are removed upstream.
-
-Syncing streams each dump and buffers records per Parquet row group
-(`--batch-size`, default 100000) — the tall schema keeps this light, but you can
-lower it on memory-constrained machines. Temporary files are cleaned up as each
-resource is processed, so peak disk use is roughly one resource at a time, not
-the whole chain:
-
-```
-$ uvx podlake sync stanford --batch-size 10000
-```
-
-## Fetch raw Parquet (data collection)
-
-To inspect the converted data without loading it into a DuckLake, `fetch`
-downloads and converts an organization's ResourceSync dumps to Parquet files on
-disk and stops there — no lake, no cursor, none of the load cost. Use
-`--full-only` to grab just the base full dump:
-
-```
-$ uvx podlake fetch stanford ./out --full-only
-```
-
-Each MARCXML resource becomes a `<name>.records.parquet` + `<name>.meta.parquet`
-pair in the output directory (delete files are copied as-is). This is handy for
-inspecting the converted data on real records.
-
-## Load pre-built Parquet (optional)
-
-`sync` is the normal way to ingest. As an escape hatch, `load` ingests a
-records + meta Parquet pair produced by `fetch` (whole-org replace), finding the
-sibling `*.meta.parquet` and deriving the org from the filename prefix:
-
-```
-$ uvx podlake load ./out/stanford-2026-02-11-full-marcxml.records.parquet
-```
-
-Loading an organization that is already present replaces its rows, so `load` is
-safe to re-run.
-
-## Publish for read-only consumers
-
-To share the lake with other institutions read-only, maintain it locally with
-the `development` profile and publish it to an S3 bucket. `publish` incrementally
-syncs the Parquet data (skipping files already in the bucket) and uploads the
-catalog, so consumers can attach to it over `s3://` with no database to reach —
-a good fit for a periodically-updated public dataset. Re-running after a daily
-sync uploads only the new files:
+**Publish** shares a local lake read-only by syncing its Parquet and catalog to
+S3; consumers then attach over `s3://` with no database to reach. It's
+incremental (skips files already uploaded), so a typical cycle is `sync-all`
+then `publish`:
 
 ```
 $ uvx podlake publish s3://your-bucket/pod   # or set PODLAKE_PUBLISH_URL
 ```
 
-A typical cycle is `sync-all` then `publish` (run on whatever schedule you like).
-Because publishing is a plain upload, the maintainer's writable lake never needs
-to be reachable by consumers — only the bucket does. See "Query the lake" for how
-consumers attach.
+Two lesser-used commands round things out: `fetch` downloads and converts an
+org's dumps to Parquet **without** loading a lake (for inspection), and `load`
+ingests such a records + meta Parquet pair directly.
 
 ## Query the lake
 
-For a quick check you can query through podlake, which connects read-only:
+For a quick check, query through podlake (it connects read-only):
 
 ```
 $ uvx podlake query "SELECT org, count(*) FROM record_meta GROUP BY org"
 ```
 
-Analysts typically connect directly with DuckDB. Attach the lake **read-only**
-so a consumer connection can never modify it:
+Analysts usually attach directly with DuckDB, **read-only** so the connection
+can never modify the lake:
 
 ```sql
 -- a published lake in a bucket (what most consumers use)
@@ -197,89 +195,31 @@ USE podlake;
 
 -- a local development lake
 INSTALL ducklake;
-ATTACH 'ducklake:podlake.ducklake' AS podlake
-  (DATA_PATH './lake-data/', READ_ONLY);
+ATTACH 'ducklake:podlake.ducklake' AS podlake (DATA_PATH './lake-data/', READ_ONLY);
 USE podlake;
-
--- a shared Postgres-catalog lake (the `production` profile)
-INSTALL ducklake; INSTALL postgres; INSTALL httpfs;
-ATTACH 'ducklake:postgres:dbname=podlake host=your-db-host user=... password=...'
-  AS podlake (DATA_PATH 's3://your-bucket/lake/', READ_ONLY);
-USE podlake;
-
--- records per organization (record_meta = one row per record)
-SELECT org, count(*) FROM record_meta GROUP BY org;
-
--- consortial overlap: works held by more than one institution
-SELECT goldrush_key, count(DISTINCT org) AS orgs
-FROM record_meta
-GROUP BY goldrush_key
-HAVING orgs > 1;
 ```
 
-`records` is tall — one row per subfield — so query it accordingly. The columns
-are `org, pod_record_id, field_tag, field_seq, ind1, ind2, subfield_code,
-subfield_seq, value` (the leader is `field_tag='LDR'`; control fields have a
-NULL `subfield_code`).
-
-```sql
--- all titles (245 $a)
-SELECT value FROM records WHERE field_tag='245' AND subfield_code='a';
-
--- pull several fields per record as columns (conditional aggregation)
-SELECT pod_record_id,
-  max(value) FILTER (WHERE field_tag='245' AND subfield_code='a') AS title,
-  max(value) FILTER (WHERE field_tag='100' AND subfield_code='a') AS author
-FROM records
-WHERE field_tag IN ('245','100')
-GROUP BY pod_record_id;
-
--- the same thing as a self-join, when you prefer it
-SELECT t.pod_record_id, t.value AS title, a.value AS author
-FROM records t JOIN records a USING (pod_record_id)
-WHERE t.field_tag='245' AND t.subfield_code='a'
-  AND a.field_tag='100' AND a.subfield_code='a';
-
--- the whole 245 field (subfields joined in order)
-SELECT pod_record_id, string_agg(value, ' ' ORDER BY subfield_seq) AS field_245
-FROM records WHERE field_tag='245' GROUP BY pod_record_id, field_seq;
-
--- reconstruct a record in order (leader first, then fields/subfields)
-SELECT field_tag, ind1, ind2, subfield_code, value
-FROM records WHERE pod_record_id = 'stanford:a1'
-ORDER BY field_seq, subfield_seq;
-```
-
-The `OVERRIDE_DATA_PATH true` on the published-lake attach is needed because the
-catalog was written with a local data path and consumers re-root it at the
-bucket. A public bucket needs no credentials; for a private bucket, consumers
-supply read-only AWS credentials (e.g. via a `CREATE SECRET (TYPE s3, ...)`).
-
-Because DuckLake uses snapshot isolation, the maintainer can update or republish
-the lake while analysts keep querying — readers always see the last
-fully-committed snapshot and can even pin a version for reproducibility with
-`FROM records AT (VERSION => N)`.
-
-The `READ_ONLY` flag stops a consumer *connection* from writing. For a stronger
-guarantee, enforce it with credentials: for a published bucket, grant consumers
-read-only S3 access (`s3:GetObject` / `s3:ListBucket`) and keep write access for
-the maintainer; for the Postgres model, give analysts a `SELECT`-only role.
+`OVERRIDE_DATA_PATH true` re-roots the published catalog at the bucket. A public
+bucket needs no credentials; for a private one, consumers supply read-only AWS
+credentials via `CREATE SECRET (TYPE s3, ...)`. Thanks to snapshot isolation the
+maintainer can republish while analysts keep querying, and a reader can pin a
+version with `FROM records AT (VERSION => N)`. See the schema section above for
+query patterns.
 
 ## Develop
-
-Clone the repository, make changes, and run the tests:
 
 ```
 $ uv run pytest
 ```
 
-The tests run entirely locally (no network or `PODBUCKET_POD_TOKEN` needed):
-ResourceSync manifest parsing is tested with fixtures, MARCXML conversion with
-small in-test dumps, and the lake/publish paths against a temporary
-development-profile lake (S3 is mocked with moto).
+Tests run entirely locally (no network or `PODBUCKET_POD_TOKEN` needed):
+ResourceSync manifest parsing with fixtures, MARCXML conversion with small
+in-test dumps, and the lake/publish paths against a temporary development-profile
+lake (S3 is mocked with moto).
 
 [POD]: https://pod.stanford.edu/
 [ResourceSync]: https://www.openarchives.org/rs/toc
 [uv]: https://docs.astral.sh/uv/
-[marctable]: https://github.com/sul-dlss-labs/marctable
+[goldrush]: https://github.com/co-alliance/coalliance-matchkey
 [DuckLake]: https://ducklake.select/
+[mrrc]: https://github.com/dchud/mrrc/blob/main/docs/history/format-research/EVALUATION_PARQUET.md
