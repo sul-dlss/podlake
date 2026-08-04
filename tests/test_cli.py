@@ -56,7 +56,7 @@ def _resources():
     ]
 
 
-def _fake_download(url, path, fixity=None):
+def _fake_download(url, path, fixity=None, desc=None):
     if url.endswith(".del.txt"):
         path.write_text("a2\n")  # delete record a2
     else:

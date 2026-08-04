@@ -161,8 +161,17 @@ def _sync_org(
         with tempfile.TemporaryDirectory() as tmp:
             if resource.kind == "deletes":
                 del_path = Path(tmp) / "deletes.txt"
-                resourcesync.download(resource.url, del_path, fixity=resource.fixity)
+                resourcesync.download(
+                    resource.url,
+                    del_path,
+                    fixity=resource.fixity,
+                    desc=f"{org} {resource.kind}: downloading",
+                )
                 ids = [f"{org}:{rid}" for rid in resourcesync.read_delete_ids(del_path)]
+                typer.echo(
+                    f"  {org} deletes: removing {len(ids):,} records from the lake…",
+                    err=True,
+                )
                 _, deleted = lake.apply_resource(
                     con, org, "deletes", ids, resource.lastmod
                 )
@@ -170,7 +179,12 @@ def _sync_org(
             else:
                 suffix = ".xml.gz" if resource.url.endswith(".gz") else ".xml"
                 dl_path = Path(tmp) / f"resource{suffix}"
-                resourcesync.download(resource.url, dl_path, fixity=resource.fixity)
+                resourcesync.download(
+                    resource.url,
+                    dl_path,
+                    fixity=resource.fixity,
+                    desc=f"{org} {resource.kind}: downloading",
+                )
                 records_pq = Path(tmp) / "records.parquet"
                 meta_pq = Path(tmp) / "meta.parquet"
                 with tqdm(
@@ -185,6 +199,13 @@ def _sync_org(
                         on_record=lambda _: progress.update(1),
                         limit=limit,
                     )
+                # apply_resource runs a delete+insert upsert with no progress of
+                # its own; announce it so the wait isn't mistaken for a stall.
+                typer.echo(
+                    f"  {org} {resource.kind}: updating the lake with "
+                    f"{progress.n:,} records…",
+                    err=True,
+                )
                 changed, _ = lake.apply_resource(
                     con, org, resource.kind, (records_pq, meta_pq), resource.lastmod
                 )

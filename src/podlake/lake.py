@@ -1,4 +1,5 @@
 import logging
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -32,6 +33,13 @@ def connect(
     logger.info("attaching ducklake (%s, read_only=%s)", config.env, read_only)
     con.execute(config.attach_sql(read_only=read_only))
     con.execute(f"USE {LAKE_ALIAS}")
+
+    # Show DuckDB's progress bar for long-running statements — notably the
+    # delete+insert upsert that `apply_resource` runs after conversion — so a
+    # busy apply step isn't mistaken for a hang. Only in an interactive
+    # terminal, to keep non-interactive runs (cron/`sync-all`) quiet.
+    if sys.stdout.isatty():
+        con.execute("SET enable_progress_bar = true")
 
     return con
 
@@ -173,13 +181,20 @@ def apply_resource(
             records_pq, meta_pq = payload
             # incoming ids come from meta (one row per record)
             ids_subquery = "(SELECT pod_record_id FROM read_parquet(?))"
+            # Scope both deletes to the org partition. Without the `org =`
+            # predicate DuckLake can't prune, so the delete scans every org's
+            # data to find this resource's ids — a full-table scan that is very
+            # slow on a multi-org lake. Every id in the resource belongs to
+            # `org`, so restricting to it is safe.
             con.execute(
-                f"DELETE FROM {RECORDS_TABLE} WHERE pod_record_id IN {ids_subquery}",
-                [str(meta_pq)],
+                f"DELETE FROM {RECORDS_TABLE} "
+                f"WHERE org = ? AND pod_record_id IN {ids_subquery}",
+                [org, str(meta_pq)],
             )
             con.execute(
-                f"DELETE FROM {META_TABLE} WHERE pod_record_id IN {ids_subquery}",
-                [str(meta_pq)],
+                f"DELETE FROM {META_TABLE} "
+                f"WHERE org = ? AND pod_record_id IN {ids_subquery}",
+                [org, str(meta_pq)],
             )
             con.execute(
                 f"INSERT INTO {RECORDS_TABLE} SELECT * FROM read_parquet(?)",
@@ -199,12 +214,13 @@ def apply_resource(
                 placeholders = ", ".join("?" for _ in payload)
                 con.execute(
                     f"DELETE FROM {RECORDS_TABLE} "
-                    f"WHERE pod_record_id IN ({placeholders})",
-                    payload,
+                    f"WHERE org = ? AND pod_record_id IN ({placeholders})",
+                    [org, *payload],
                 )
                 con.execute(
-                    f"DELETE FROM {META_TABLE} WHERE pod_record_id IN ({placeholders})",
-                    payload,
+                    f"DELETE FROM {META_TABLE} "
+                    f"WHERE org = ? AND pod_record_id IN ({placeholders})",
+                    [org, *payload],
                 )
                 deleted_count = len(payload)
         else:

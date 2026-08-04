@@ -8,6 +8,7 @@ from pathlib import Path
 
 import httpx
 from lxml import etree
+from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -107,11 +108,17 @@ def _classify(url: str, mediatype: str) -> str:
     return "delta"
 
 
-def download(url: str, path: Path, fixity: str | None = None) -> Path:
+def download(
+    url: str, path: Path, fixity: str | None = None, desc: str | None = None
+) -> Path:
     """
     Stream a POD URL to a local path (following redirects to signed storage
     URLs). If `fixity` is a "md5:<hex>" string, verify the download against it
     and raise on mismatch.
+
+    Shows a byte progress bar (labelled `desc`) so a large full-dump download
+    isn't mistaken for a stall; the bar auto-disables when not attached to a
+    terminal (e.g. cron), so non-interactive runs stay quiet.
     """
     algo = expected = None
     hasher = None
@@ -129,10 +136,20 @@ def download(url: str, path: Path, fixity: str | None = None) -> Path:
         ) as resp,
     ):
         resp.raise_for_status()
-        for chunk in resp.iter_bytes():
-            output.write(chunk)
-            if hasher is not None:
-                hasher.update(chunk)
+        total = int(resp.headers.get("content-length") or 0) or None
+        with tqdm(
+            total=total,
+            desc=desc or path.name,
+            unit="B",
+            unit_scale=True,
+            unit_divisor=1024,
+            disable=None,
+        ) as bar:
+            for chunk in resp.iter_bytes():
+                output.write(chunk)
+                bar.update(len(chunk))
+                if hasher is not None:
+                    hasher.update(chunk)
 
     if hasher is not None and hasher.hexdigest() != expected:
         raise ValueError(
