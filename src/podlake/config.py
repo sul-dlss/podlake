@@ -12,25 +12,27 @@ class Config:
     """
     Resolved podlake configuration for the active profile.
 
-    Two profiles are supported, selected with the PODLAKE_ENV environment
-    variable:
+    Two profiles are supported, selected with the PODLAKE_PROFILE environment
+    variable and named for the catalog backend each uses:
 
-    - "development" (default): a local DuckDB catalog file and a local Parquet
-      DATA_PATH. No external services required.
-    - "production": a Postgres catalog and an S3 DATA_PATH. AWS credentials are
-      resolved by DuckDB's credential_chain (standard AWS_* env vars, shared
-      config, or an assumed role).
+    - "file" (default): a local DuckDB catalog file and a local Parquet
+      DATA_PATH. No external services required. This is also the profile you
+      run in production and then `publish` to S3 for read-only consumers.
+    - "postgres": a Postgres catalog and an S3 DATA_PATH, for a shared lake with
+      concurrent writers. AWS credentials are resolved by DuckDB's
+      credential_chain (standard AWS_* env vars, shared config, or an assumed
+      role).
     """
 
-    env: str
+    profile: str
     data_path: str
     catalog_uri: str
     pg: dict[str, str] = field(default_factory=dict)
     publish_url: str | None = None
 
     @property
-    def is_production(self) -> bool:
-        return self.env == "production"
+    def is_postgres(self) -> bool:
+        return self.profile == "postgres"
 
     @property
     def is_file_catalog(self) -> bool:
@@ -59,10 +61,10 @@ class Config:
         suitable for printing in the `config` command.
         """
         info = {
-            "PODLAKE_ENV": self.env,
+            "PODLAKE_PROFILE": self.profile,
             "data_path": self.data_path,
         }
-        if self.is_production:
+        if self.is_postgres:
             info["catalog"] = "postgres"
             info["postgres_host"] = self.pg.get("host", "")
             info["postgres_dbname"] = self.pg.get("dbname", "")
@@ -80,29 +82,29 @@ def get_config() -> Config:
     """
     dotenv.load_dotenv()
 
-    env = os.environ.get("PODLAKE_ENV", "development").lower()
-    if env not in ("development", "production"):
+    profile = os.environ.get("PODLAKE_PROFILE", "file").lower()
+    if profile not in ("file", "postgres"):
         raise ValueError(
-            f"PODLAKE_ENV must be 'development' or 'production', not {env!r}"
+            f"PODLAKE_PROFILE must be 'file' or 'postgres', not {profile!r}"
         )
 
-    if env == "production":
-        return _production_config()
-    return _development_config()
+    if profile == "postgres":
+        return _postgres_config()
+    return _file_config()
 
 
-def _development_config() -> Config:
+def _file_config() -> Config:
     catalog = os.environ.get("PODLAKE_CATALOG", "podlake.ducklake")
     data_path = os.environ.get("PODLAKE_DATA_PATH", "./lake-data/")
     return Config(
-        env="development",
+        profile="file",
         data_path=data_path,
         catalog_uri=catalog,
         publish_url=os.environ.get("PODLAKE_PUBLISH_URL"),
     )
 
 
-def _production_config() -> Config:
+def _postgres_config() -> Config:
     data_path = _require("PODLAKE_DATA_PATH")
 
     dsn = os.environ.get("PODLAKE_PG_DSN")
@@ -121,7 +123,7 @@ def _production_config() -> Config:
     catalog_uri = "postgres:" + " ".join(f"{k}={v}" for k, v in pg.items())
 
     return Config(
-        env="production",
+        profile="postgres",
         data_path=data_path,
         catalog_uri=catalog_uri,
         pg=pg,
@@ -145,7 +147,7 @@ def _require(name: str) -> str:
     value = os.environ.get(name)
     if not value:
         raise RuntimeError(
-            f"{name} environment variable must be set for the production profile"
+            f"{name} environment variable must be set for the postgres profile"
         )
     return value
 

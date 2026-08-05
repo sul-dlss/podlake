@@ -19,12 +19,12 @@ app = typer.Typer()
 def config():
     """
     Show the resolved configuration for the active profile (set with the
-    PODLAKE_ENV environment variable) and verify that the DuckLake catalog can
-    be attached.
+    PODLAKE_PROFILE environment variable) and verify that the DuckLake catalog
+    can be attached.
     """
     cfg = get_config()
 
-    print(f"[bold]podlake configuration[/bold] ({cfg.env})")
+    print(f"[bold]podlake configuration[/bold] ({cfg.profile})")
     for key, value in cfg.describe().items():
         print(f"  {key} = {value}")
 

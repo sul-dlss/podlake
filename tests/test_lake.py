@@ -13,7 +13,7 @@ from podlake.config import Config
 
 def _dev_config(tmp_path: Path) -> Config:
     return Config(
-        env="development",
+        profile="file",
         data_path=str(tmp_path / "data") + "/",
         catalog_uri=str(tmp_path / "podlake.ducklake"),
     )
@@ -282,7 +282,7 @@ def test_publish_incremental(tmp_path):
 
 def test_publish_rejects_postgres_catalog(tmp_path):
     pg_config = Config(
-        env="production",
+        profile="postgres",
         data_path="s3://x/lake/",
         catalog_uri="postgres:dbname=podlake host=db",
     )

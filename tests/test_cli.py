@@ -112,7 +112,7 @@ def test_fetch_full_only(tmp_path, monkeypatch):
 
 def test_sync_loads_into_lake(tmp_path, monkeypatch):
     _patch(monkeypatch)
-    monkeypatch.setenv("PODLAKE_ENV", "development")
+    monkeypatch.setenv("PODLAKE_PROFILE", "file")
     monkeypatch.setenv("PODLAKE_CATALOG", str(tmp_path / "podlake.ducklake"))
     monkeypatch.setenv("PODLAKE_DATA_PATH", str(tmp_path / "data") + "/")
 
