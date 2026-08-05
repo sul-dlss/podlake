@@ -30,7 +30,7 @@ def connect(
     _load_extensions(con, config)
     _configure_storage(con, config)
 
-    logger.info("attaching ducklake (%s, read_only=%s)", config.env, read_only)
+    logger.info("attaching ducklake (%s, read_only=%s)", config.profile, read_only)
     con.execute(config.attach_sql(read_only=read_only))
     con.execute(f"USE {LAKE_ALIAS}")
 
@@ -291,7 +291,7 @@ def _table_exists(con: duckdb.DuckDBPyConnection, name: str) -> bool:
 
 def _load_extensions(con: duckdb.DuckDBPyConnection, config: Config) -> None:
     extensions = ["ducklake"]
-    if config.is_production:
+    if config.is_postgres:
         extensions += ["postgres", "httpfs", "aws"]
     for ext in extensions:
         con.execute(f"INSTALL {ext}")
@@ -300,11 +300,11 @@ def _load_extensions(con: duckdb.DuckDBPyConnection, config: Config) -> None:
 
 def _configure_storage(con: duckdb.DuckDBPyConnection, config: Config) -> None:
     """
-    In production the DATA_PATH lives in S3, so register an S3 secret that
-    resolves credentials via DuckDB's credential_chain (standard AWS_* env
-    vars, shared config, or an assumed role).
+    With the postgres profile the DATA_PATH lives in S3, so register an S3
+    secret that resolves credentials via DuckDB's credential_chain (standard
+    AWS_* env vars, shared config, or an assumed role).
     """
-    if config.is_production and config.data_path.startswith("s3://"):
+    if config.is_postgres and config.data_path.startswith("s3://"):
         con.execute(
             "CREATE SECRET IF NOT EXISTS pod_s3 (TYPE s3, PROVIDER credential_chain)"
         )

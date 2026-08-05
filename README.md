@@ -124,23 +124,23 @@ $ uvx podlake --help
 
 Configure it with environment variables (read from a `.env` file or the
 environment): put your POD token in `PODBUCKET_POD_TOKEN` and pick a profile with
-`PODLAKE_ENV`. The default **`development`** profile uses a local catalog file
-and local Parquet — ideal for building a lake locally and then publishing it:
+`PODLAKE_PROFILE`. The default **`file`** profile uses a local catalog file and
+local Parquet — ideal for building a lake locally and then publishing it:
 
 ```sh
 PODBUCKET_POD_TOKEN=your-pod-token
-PODLAKE_ENV=development
+PODLAKE_PROFILE=file
 PODLAKE_CATALOG=podlake.ducklake         # local catalog file (default)
 PODLAKE_DATA_PATH=./lake-data/           # where Parquet data files live (default)
 PODLAKE_PUBLISH_URL=s3://your-bucket/pod # optional default target for `publish`
 ```
 
-In production you run that same `development` profile on a server, `sync`, and
+In production you run that same `file` profile on a server, `sync`, and
 `publish` the file-catalog lake to S3 (below); POD members then attach to the
 bucket read-only, with no database to run or expose. This suits a periodically
 updated, read-mostly, widely-shared lake — the catalog is a small file in the
 bucket, and S3 fans out to many readers far more easily than a database
-connection would. (A Postgres-catalog **`production`** profile also exists, but
+connection would. (A Postgres-catalog **`postgres`** profile also exists, but
 it's only worth the operational overhead for a lake with *concurrent writers* or
 many-times-a-day live updates — not for read-only sharing.) Confirm the resolved
 profile with `uvx podlake config`.
@@ -193,7 +193,7 @@ ATTACH 'ducklake:s3://your-bucket/pod/podlake.ducklake' AS podlake
   (DATA_PATH 's3://your-bucket/pod/lake-data/', READ_ONLY, OVERRIDE_DATA_PATH true);
 USE podlake;
 
--- a local development lake
+-- a local file-catalog lake
 INSTALL ducklake;
 ATTACH 'ducklake:podlake.ducklake' AS podlake (DATA_PATH './lake-data/', READ_ONLY);
 USE podlake;
@@ -214,8 +214,8 @@ $ uv run pytest
 
 Tests run entirely locally (no network or `PODBUCKET_POD_TOKEN` needed):
 ResourceSync manifest parsing with fixtures, MARCXML conversion with small
-in-test dumps, and the lake/publish paths against a temporary development-profile
-lake (S3 is mocked with moto).
+in-test dumps, and the lake/publish paths against a temporary file-profile lake
+(S3 is mocked with moto).
 
 [POD]: https://pod.stanford.edu/
 [ResourceSync]: https://www.openarchives.org/rs/toc
