@@ -162,6 +162,12 @@ cleanly. Run `sync-all` on a schedule (cron, a systemd timer, a Kubernetes
 CronJob, GitHub Actions) to keep the lake current. Lower `--batch-size` (default
 100000) on memory-constrained machines.
 
+Merging a large resource into the lake can be memory-hungry. Set
+`PODLAKE_MEMORY_LIMIT` (e.g. `10GB` on a 16GB box) to cap DuckDB's RAM — past
+the limit it spills to disk rather than risking the OOM killer. The spill (and
+each resource's download/conversion) goes to `$TMPDIR`, so point that at a roomy
+volume if your default temp dir is small.
+
 **Publish** shares a local lake read-only by syncing its Parquet and catalog to
 S3; consumers then attach over `s3://` with no database to reach. It's
 incremental (skips files already uploaded), so a typical cycle is `sync-all`
