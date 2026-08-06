@@ -22,6 +22,10 @@ class Config:
       concurrent writers. AWS credentials are resolved by DuckDB's
       credential_chain (standard AWS_* env vars, shared config, or an assumed
       role).
+
+    PODLAKE_MEMORY_LIMIT, if set (e.g. "10GB"), caps DuckDB's memory; past the
+    limit it spills to disk (in $TMPDIR, same as downloads) instead of risking
+    the OOM killer.
     """
 
     profile: str
@@ -29,6 +33,7 @@ class Config:
     catalog_uri: str
     pg: dict[str, str] = field(default_factory=dict)
     publish_url: str | None = None
+    memory_limit: str | None = None
 
     @property
     def is_postgres(self) -> bool:
@@ -63,6 +68,7 @@ class Config:
         info = {
             "PODLAKE_PROFILE": self.profile,
             "data_path": self.data_path,
+            "memory_limit": self.memory_limit or "(DuckDB default)",
         }
         if self.is_postgres:
             info["catalog"] = "postgres"
@@ -101,6 +107,7 @@ def _file_config() -> Config:
         data_path=data_path,
         catalog_uri=catalog,
         publish_url=os.environ.get("PODLAKE_PUBLISH_URL"),
+        memory_limit=os.environ.get("PODLAKE_MEMORY_LIMIT"),
     )
 
 
@@ -128,6 +135,7 @@ def _postgres_config() -> Config:
         catalog_uri=catalog_uri,
         pg=pg,
         publish_url=os.environ.get("PODLAKE_PUBLISH_URL"),
+        memory_limit=os.environ.get("PODLAKE_MEMORY_LIMIT"),
     )
 
 

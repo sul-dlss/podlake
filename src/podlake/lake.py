@@ -1,5 +1,6 @@
 import logging
 import sys
+import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -33,6 +34,15 @@ def connect(
     logger.info("attaching ducklake (%s, read_only=%s)", config.profile, read_only)
     con.execute(config.attach_sql(read_only=read_only))
     con.execute(f"USE {LAKE_ALIAS}")
+
+    # Spill to the same temp location as downloads (honors $TMPDIR), and cap
+    # DuckDB's memory if configured, so a big merge overflows to disk instead of
+    # ballooning until the OOM killer steps in.
+    spill = tempfile.gettempdir().replace("'", "''")
+    con.execute(f"SET temp_directory = '{spill}'")
+    if config.memory_limit:
+        limit = config.memory_limit.replace("'", "''")
+        con.execute(f"SET memory_limit = '{limit}'")
 
     # Show DuckDB's progress bar for long-running statements — notably the
     # delete+insert upsert that `apply_resource` runs after conversion — so a

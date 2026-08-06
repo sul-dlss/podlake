@@ -229,6 +229,21 @@ def test_get_cursor_absent(tmp_path):
     con.close()
 
 
+def test_connect_caps_memory_and_sets_spill_dir(tmp_path):
+    config = _dev_config(tmp_path)
+    config.memory_limit = "512MiB"
+    con = lake.connect(read_only=False, config=config)
+    try:
+        # spilling is enabled (DuckDB has a temp dir, derived from $TMPDIR)
+        spill = con.execute("SELECT current_setting('temp_directory')").fetchone()
+        assert spill and spill[0]
+        # and the memory cap is applied (DuckDB reports it as "512.0 MiB")
+        limit = con.execute("SELECT current_setting('memory_limit')").fetchone()
+        assert limit and "512" in limit[0]
+    finally:
+        con.close()
+
+
 def test_read_only_cannot_write(tmp_path):
     config = _dev_config(tmp_path)
     rpq, mpq = _write_org(tmp_path, "stanford", [_record("stanford", "a1", "T", "k")])
