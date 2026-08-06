@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import duckdb
+import pyarrow as pa
 
 from podlake.config import LAKE_ALIAS, Config, get_config
 from podlake.storage import Storage
@@ -221,17 +222,26 @@ def apply_resource(
         elif kind == "deletes":
             assert isinstance(payload, list)
             if payload:
-                placeholders = ", ".join("?" for _ in payload)
-                con.execute(
-                    f"DELETE FROM {RECORDS_TABLE} "
-                    f"WHERE org = ? AND pod_record_id IN ({placeholders})",
-                    [org, *payload],
-                )
-                con.execute(
-                    f"DELETE FROM {META_TABLE} "
-                    f"WHERE org = ? AND pod_record_id IN ({placeholders})",
-                    [org, *payload],
-                )
+                # Semi-join against the ids as a registered relation, like the
+                # delta path reads ids from a Parquet subquery. A big deletes
+                # file (200k+ ids) would otherwise be a giant literal
+                # IN (?, ?, …) list — an enormous SQL string + bind. Register
+                # the ids as a (zero-copy) Arrow table and reference it instead.
+                con.register("delete_ids", pa.table({"pod_record_id": payload}))
+                try:
+                    id_subquery = "(SELECT pod_record_id FROM delete_ids)"
+                    con.execute(
+                        f"DELETE FROM {RECORDS_TABLE} "
+                        f"WHERE org = ? AND pod_record_id IN {id_subquery}",
+                        [org],
+                    )
+                    con.execute(
+                        f"DELETE FROM {META_TABLE} "
+                        f"WHERE org = ? AND pod_record_id IN {id_subquery}",
+                        [org],
+                    )
+                finally:
+                    con.unregister("delete_ids")
                 deleted_count = len(payload)
         else:
             raise ValueError(f"unknown resource kind: {kind}")
