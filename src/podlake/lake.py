@@ -147,6 +147,18 @@ def get_cursor(con: duckdb.DuckDBPyConnection, org: str) -> datetime | None:
     return row[0].replace(tzinfo=UTC)
 
 
+def all_cursors(con: duckdb.DuckDBPyConnection) -> dict[str, datetime]:
+    """
+    Return {org: last processed lastmod (UTC)} from harvest_state, or {} if the
+    lake has never been synced. Unlike get_cursor this never creates the table,
+    so it is safe to call on a read-only connection (used by `podlake status`).
+    """
+    if not _table_exists(con, STATE_TABLE):
+        return {}
+    rows = con.execute(f"SELECT org, last_modified FROM {STATE_TABLE}").fetchall()
+    return {org: ts.replace(tzinfo=UTC) for org, ts in rows if ts is not None}
+
+
 def _set_cursor(
     con: duckdb.DuckDBPyConnection, org: str, last_modified: datetime
 ) -> None:

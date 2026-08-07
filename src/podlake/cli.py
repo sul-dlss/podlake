@@ -79,6 +79,62 @@ def streams(
 
 
 @app.command()
+def status(
+    org_name: Annotated[
+        str | None, typer.Argument(help="Limit to one organization")
+    ] = None,
+    list_files: Annotated[
+        bool,
+        typer.Option("--list", help="List each resource with its processed status"),
+    ] = False,
+):
+    """
+    Show, per organization, which ResourceSync resources have already been
+    synced and which are still pending (newer than the org's cursor). Name a
+    single organization, or pass --list, to see each resource individually.
+    """
+    get_config()
+    found = resourcesync.get_streams(org_name)
+    if not found:
+        typer.echo(f"No ResourceSync stream found for {org_name}", err=True)
+        raise typer.Exit(code=1)
+
+    cursors = _load_cursors()
+    for name, url in sorted(found.items()):
+        cursor = cursors.get(name)
+        resources = resourcesync.get_resources(url)
+        pending = [r for r in resources if cursor is None or r.lastmod > cursor]
+        done = len(resources) - len(pending)
+        pending_size = humanize.naturalsize(sum(r.length for r in pending))
+        when = cursor.date().isoformat() if cursor else "never synced"
+        print(
+            f"- [bold]{name}[/bold]: {done} processed, "
+            f"{len(pending)} pending ({pending_size}); cursor {when}"
+        )
+        if list_files or org_name:
+            for r in resources:
+                processed = cursor is not None and r.lastmod <= cursor
+                mark = "[green]✓[/green]" if processed else "[yellow]→[/yellow]"
+                name_only = r.url.rstrip("/").split("/")[-1]
+                print(
+                    f"    {mark} {r.lastmod.date().isoformat()}  {r.kind:<7} "
+                    f"{humanize.naturalsize(r.length):>10}  {name_only}"
+                )
+
+
+def _load_cursors() -> dict:
+    """Per-org sync cursors, or {} if the lake isn't built yet (read-only)."""
+    try:
+        con = lake.connect(read_only=True)
+    except duckdb.Error:
+        return {}
+    try:
+        return lake.all_cursors(con)
+    finally:
+        con.close()
+
+
+@app.command()
 def sync(
     org_name: Annotated[str, typer.Argument(help="Organization name")],
     batch_size: Annotated[
@@ -156,8 +212,17 @@ def _sync_org(
     resources = resourcesync.get_resources(resourcelist_url)
     pending = [r for r in resources if cursor is None or r.lastmod > cursor]
 
+    total = len(pending)
+    if total:
+        size = humanize.naturalsize(sum(r.length for r in pending))
+        typer.echo(
+            f"{org}: {total} resource{'' if total == 1 else 's'} to sync ({size})",
+            err=True,
+        )
+
     total_changed = total_deleted = 0
-    for resource in pending:
+    for i, resource in enumerate(pending, 1):
+        pos = f"[{i}/{total}]"
         with tempfile.TemporaryDirectory() as tmp:
             if resource.kind == "deletes":
                 del_path = Path(tmp) / "deletes.txt"
@@ -165,11 +230,11 @@ def _sync_org(
                     resource.url,
                     del_path,
                     fixity=resource.fixity,
-                    desc=f"{org} {resource.kind}: downloading",
+                    desc=f"{pos} {org} {resource.kind}: downloading",
                 )
                 ids = [f"{org}:{rid}" for rid in resourcesync.read_delete_ids(del_path)]
                 typer.echo(
-                    f"  {org} deletes: removing {len(ids):,} records from the lake…",
+                    f"  {pos} {org} deletes: removing {len(ids):,} records from the lake…",
                     err=True,
                 )
                 _, deleted = lake.apply_resource(
@@ -183,12 +248,12 @@ def _sync_org(
                     resource.url,
                     dl_path,
                     fixity=resource.fixity,
-                    desc=f"{org} {resource.kind}: downloading",
+                    desc=f"{pos} {org} {resource.kind}: downloading",
                 )
                 records_pq = Path(tmp) / "records.parquet"
                 meta_pq = Path(tmp) / "meta.parquet"
                 with tqdm(
-                    desc=f"{org} {resource.kind}", unit=" records", smoothing=0.01
+                    desc=f"{pos} {org} {resource.kind}", unit=" records", smoothing=0.01
                 ) as progress:
                     dump_to_parquet(
                         org,
@@ -202,7 +267,7 @@ def _sync_org(
                 # apply_resource runs a delete+insert upsert with no progress of
                 # its own; announce it so the wait isn't mistaken for a stall.
                 typer.echo(
-                    f"  {org} {resource.kind}: updating the lake with "
+                    f"  {pos} {org} {resource.kind}: updating the lake with "
                     f"{progress.n:,} records…",
                     err=True,
                 )
@@ -210,7 +275,7 @@ def _sync_org(
                     con, org, resource.kind, (records_pq, meta_pq), resource.lastmod
                 )
                 total_changed += changed
-    return total_changed, total_deleted, len(pending)
+    return total_changed, total_deleted, total
 
 
 @app.command()

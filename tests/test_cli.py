@@ -110,6 +110,27 @@ def test_fetch_full_only(tmp_path, monkeypatch):
     ]
 
 
+def test_status_reports_pending_then_processed(tmp_path, monkeypatch):
+    _patch(monkeypatch)
+    monkeypatch.setenv("PODLAKE_PROFILE", "file")
+    monkeypatch.setenv("PODLAKE_CATALOG", str(tmp_path / "podlake.ducklake"))
+    monkeypatch.setenv("PODLAKE_DATA_PATH", str(tmp_path / "data") + "/")
+
+    # before any sync: lake not built, so everything is pending
+    before = runner.invoke(app, ["status", "brown"])
+    assert before.exit_code == 0, before.output
+    assert "0 processed" in before.output
+    assert "3 pending" in before.output
+    assert "never synced" in before.output
+
+    # after syncing all three resources, they all count as processed
+    assert runner.invoke(app, ["sync", "brown"]).exit_code == 0
+    after = runner.invoke(app, ["status", "brown"])
+    assert after.exit_code == 0, after.output
+    assert "3 processed" in after.output
+    assert "0 pending" in after.output
+
+
 def test_sync_loads_into_lake(tmp_path, monkeypatch):
     _patch(monkeypatch)
     monkeypatch.setenv("PODLAKE_PROFILE", "file")
