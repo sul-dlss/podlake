@@ -9,7 +9,7 @@ from rich import print
 from tqdm import tqdm
 
 from podlake import lake, resourcesync
-from podlake.config import get_config
+from podlake.config import Config, get_config
 from podlake.convert import dump_to_parquet
 
 app = typer.Typer()
@@ -93,13 +93,13 @@ def status(
     synced and which are still pending (newer than the org's cursor). Name a
     single organization, or pass --list, to see each resource individually.
     """
-    get_config()
+    config = get_config()
     found = resourcesync.get_streams(org_name)
     if not found:
         typer.echo(f"No ResourceSync stream found for {org_name}", err=True)
         raise typer.Exit(code=1)
 
-    cursors = _load_cursors()
+    cursors = _load_cursors(config)
     for name, url in sorted(found.items()):
         cursor = cursors.get(name)
         resources = resourcesync.get_resources(url)
@@ -122,12 +122,25 @@ def status(
                 )
 
 
-def _load_cursors() -> dict:
-    """Per-org sync cursors, or {} if the lake isn't built yet (read-only)."""
-    try:
-        con = lake.connect(read_only=True)
-    except duckdb.Error:
+def _load_cursors(config: Config) -> dict:
+    """
+    Per-org sync cursors, read read-only.
+
+    Returns {} when the lake genuinely hasn't been built yet, so `status` shows
+    everything as pending (which is correct). If the lake *does* exist but can't
+    be read — e.g. it's locked by a running sync — this errors out rather than
+    silently reporting every resource as never-synced.
+    """
+    if config.is_file_catalog and not Path(config.catalog_uri).exists():
         return {}
+    try:
+        con = lake.connect(read_only=True, config=config)
+    except duckdb.Error as e:
+        typer.echo(
+            f"could not read the lake (it may be locked by a running sync): {e}",
+            err=True,
+        )
+        raise typer.Exit(code=1) from e
     try:
         return lake.all_cursors(con)
     finally:
