@@ -110,6 +110,42 @@ def test_fetch_full_only(tmp_path, monkeypatch):
     ]
 
 
+def test_status_reports_pending_then_processed(tmp_path, monkeypatch):
+    _patch(monkeypatch)
+    monkeypatch.setenv("PODLAKE_PROFILE", "file")
+    monkeypatch.setenv("PODLAKE_CATALOG", str(tmp_path / "podlake.ducklake"))
+    monkeypatch.setenv("PODLAKE_DATA_PATH", str(tmp_path / "data") + "/")
+
+    # before any sync: lake not built, so everything is pending
+    before = runner.invoke(app, ["status", "brown"])
+    assert before.exit_code == 0, before.output
+    assert "0 processed" in before.output
+    assert "3 pending" in before.output
+    assert "never synced" in before.output
+
+    # after syncing all three resources, they all count as processed
+    assert runner.invoke(app, ["sync", "brown"]).exit_code == 0
+    after = runner.invoke(app, ["status", "brown"])
+    assert after.exit_code == 0, after.output
+    assert "3 processed" in after.output
+    assert "0 pending" in after.output
+
+
+def test_status_errors_when_lake_exists_but_unreadable(tmp_path, monkeypatch):
+    _patch(monkeypatch)
+    monkeypatch.setenv("PODLAKE_PROFILE", "file")
+    # a catalog file that exists but isn't a valid DuckLake -> attach fails
+    catalog = tmp_path / "podlake.ducklake"
+    catalog.write_text("not a real ducklake catalog")
+    monkeypatch.setenv("PODLAKE_CATALOG", str(catalog))
+    monkeypatch.setenv("PODLAKE_DATA_PATH", str(tmp_path / "data") + "/")
+
+    result = runner.invoke(app, ["status", "brown"])
+    # errors out instead of silently reporting everything as "never synced"
+    assert result.exit_code == 1
+    assert "never synced" not in result.output
+
+
 def test_sync_loads_into_lake(tmp_path, monkeypatch):
     _patch(monkeypatch)
     monkeypatch.setenv("PODLAKE_PROFILE", "file")
