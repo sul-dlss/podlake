@@ -303,3 +303,77 @@ def test_publish_rejects_postgres_catalog(tmp_path):
     )
     with pytest.raises(ValueError):
         lake.publish(pg_config, "s3://pod-public/lake")
+
+
+def test_compact_reclaims_superseded_data(tmp_path):
+    config = _dev_config(tmp_path)
+    con = lake.connect(read_only=False, config=config)
+    try:
+
+        def build(name: str, title: str) -> tuple[Path, Path]:
+            # enough rows to write real Parquet files (not inlined into the catalog)
+            src = duckdb.connect()
+            src.execute(
+                "CREATE TABLE t (org VARCHAR, pod_record_id VARCHAR, field_tag VARCHAR, "
+                "field_seq INTEGER, ind1 VARCHAR, ind2 VARCHAR, subfield_code VARCHAR, "
+                "subfield_seq INTEGER, value VARCHAR)"
+            )
+            src.execute(
+                "INSERT INTO t SELECT 'stanford', 'stanford:' || i, '245', 1, '1', '0', "
+                f"'a', 0, '{title} ' || i FROM range(20000) tbl(i)"
+            )
+            src.execute(
+                "CREATE TABLE m (org VARCHAR, pod_record_id VARCHAR, goldrush_key VARCHAR)"
+            )
+            src.execute(
+                "INSERT INTO m SELECT 'stanford', 'stanford:' || i, 'k' || i "
+                "FROM range(20000) tbl(i)"
+            )
+            rpq = tmp_path / f"{name}.records.parquet"
+            mpq = tmp_path / f"{name}.meta.parquet"
+            src.execute(f"COPY t TO '{rpq}' (FORMAT parquet)")
+            src.execute(f"COPY m TO '{mpq}' (FORMAT parquet)")
+            src.close()
+            return rpq, mpq
+
+        r, m = build("full", "One")
+        lake.load_pair(con, "stanford", r, m)
+        # a full re-import supersedes every record -> the first copy is now dead
+        r, m = build("reimport", "Two")
+        lake.apply_resource(
+            con, "stanford", "delta", (r, m), datetime(2026, 3, 1, tzinfo=UTC)
+        )
+
+        data_dir = tmp_path / "data"
+
+        def data_size() -> int:
+            return sum(f.stat().st_size for f in data_dir.rglob("*") if f.is_file())
+
+        before = data_size()
+        stats = lake.compact(con, days=0)
+
+        assert stats["snapshots_after"] < stats["snapshots_before"]
+        assert stats["cleaned"] >= 1  # the superseded copy's files were deleted
+        assert data_size() < before  # disk actually reclaimed
+        # the live data is the superseding version, still complete
+        assert con.execute("SELECT count(*) FROM record_meta").fetchone() == (20000,)
+        assert con.execute(
+            "SELECT value FROM records WHERE pod_record_id = 'stanford:0'"
+        ).fetchone() == ("Two 0",)
+    finally:
+        con.close()
+
+
+def test_compact_dry_run_changes_nothing(tmp_path):
+    config = _dev_config(tmp_path)
+    con = lake.connect(read_only=False, config=config)
+    try:
+        rpq, mpq = _write_org(
+            tmp_path, "stanford", [_record("stanford", "a1", "T", "k1")]
+        )
+        lake.load_pair(con, "stanford", rpq, mpq)
+        stats = lake.compact(con, days=0, dry_run=True)
+        assert stats["snapshots_after"] == stats["snapshots_before"]
+        assert stats["merged"] == 0
+    finally:
+        con.close()

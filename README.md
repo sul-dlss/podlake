@@ -168,6 +168,17 @@ the limit it spills to disk rather than risking the OOM killer. The spill (and
 each resource's download/conversion) goes to `$TMPDIR`, so point that at a roomy
 volume if your default temp dir is small.
 
+**Compact** reclaims disk. DuckLake is merge-on-read, so every delta, delete,
+and re-imported full dump leaves superseded rows and tombstoned files on disk
+until you clean up. `compact` expires old snapshots, merges small Parquet files,
+and deletes the data files no longer referenced by a live snapshot. Run it after
+a big load (use `--dry-run` first to preview, `podlake status` to sanity-check):
+
+```
+$ uvx podlake compact --dry-run   # preview what would be reclaimed
+$ uvx podlake compact             # expire all but the current snapshot and reclaim
+```
+
 **Publish** shares a local lake read-only by syncing its Parquet and catalog to
 S3; consumers then attach over `s3://` with no database to reach. It's
 incremental (skips files already uploaded), so a typical cycle is `sync-all`
