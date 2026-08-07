@@ -172,6 +172,50 @@ def _load_cursors(config: Config) -> dict:
 
 
 @app.command()
+def compact(
+    older_than_days: Annotated[
+        int,
+        typer.Option(
+            "--older-than-days",
+            help="Expire snapshots older than this many days (0 = all but the current).",
+        ),
+    ] = 0,
+    dry_run: Annotated[
+        bool,
+        typer.Option(
+            "--dry-run",
+            help="Report what would be reclaimed without changing anything.",
+        ),
+    ] = False,
+):
+    """
+    Reclaim disk space. DuckLake is merge-on-read, so superseded rows from
+    deltas/deletes and re-imported full dumps accumulate on disk until this runs:
+    it expires old snapshots, compacts small Parquet files, and deletes the data
+    files no longer referenced by a live snapshot.
+    """
+    config = get_config()
+    con = lake.connect(read_only=False, config=config)
+    try:
+        s = lake.compact(con, days=older_than_days, dry_run=dry_run)
+    finally:
+        con.close()
+
+    if dry_run:
+        print(
+            f"dry run — would expire {s['expired']} snapshot(s) and delete "
+            f"{s['cleaned']} old + {s['orphaned']} orphaned data files "
+            f"(snapshots stay at {s['snapshots_before']})"
+        )
+    else:
+        print(
+            f"snapshots {s['snapshots_before']} → {s['snapshots_after']}; "
+            f"expired {s['expired']}, merged {s['merged']}, "
+            f"deleted {s['cleaned']} old + {s['orphaned']} orphaned data files"
+        )
+
+
+@app.command()
 def sync(
     org_name: Annotated[str, typer.Argument(help="Organization name")],
     batch_size: Annotated[

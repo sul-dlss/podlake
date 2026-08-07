@@ -313,6 +313,65 @@ def publish(config: Config, dest_uri: str) -> tuple[str, str, int, int]:
     return catalog_key, data_prefix, uploaded, skipped
 
 
+def _snapshot_count(con: duckdb.DuckDBPyConnection) -> int:
+    row = con.execute(
+        f"SELECT count(*) FROM ducklake_snapshots('{LAKE_ALIAS}')"
+    ).fetchone()
+    return row[0] if row else 0
+
+
+def compact(
+    con: duckdb.DuckDBPyConnection, *, days: int = 0, dry_run: bool = False
+) -> dict[str, int]:
+    """
+    Reclaim disk in the attached lake. DuckLake is merge-on-read, so superseded
+    rows — from deltas/deletes and re-imported full dumps — pile up on disk until
+    this runs. It expires snapshots older than `days` days (0 = all but the
+    current), compacts small Parquet files, then deletes the data files no longer
+    referenced by a live snapshot. With dry_run=True nothing changes and the
+    counts report what *would* be reclaimed. Returns a stats dict.
+    """
+    dry = "true" if dry_run else "false"
+    older_than = f"now() - INTERVAL '{int(days)} days'"
+
+    def run(fn: str) -> int:
+        # Materialize via CTAS so the side-effecting table function runs fully: a
+        # bare count() can be optimized away, and fetching the functions'
+        # TIMESTAMPTZ columns into Python would require pytz. The temp table keeps
+        # the timestamps inside DuckDB.
+        con.execute(f"CREATE OR REPLACE TEMP TABLE _compact AS SELECT * FROM {fn}")
+        row = con.execute("SELECT count(*) FROM _compact").fetchone()
+        return row[0] if row else 0
+
+    before = _snapshot_count(con)
+    expired = run(
+        f"ducklake_expire_snapshots('{LAKE_ALIAS}', "
+        f"dry_run => {dry}, older_than => {older_than})"
+    )
+    # merge has no dry-run mode, so only compact for real runs
+    merged = 0 if dry_run else run(f"ducklake_merge_adjacent_files('{LAKE_ALIAS}')")
+    cleaned = run(
+        f"ducklake_cleanup_old_files('{LAKE_ALIAS}', "
+        f"dry_run => {dry}, cleanup_all => true)"
+    )
+    orphaned = run(
+        f"ducklake_delete_orphaned_files('{LAKE_ALIAS}', "
+        f"dry_run => {dry}, cleanup_all => true)"
+    )
+    con.execute("DROP TABLE IF EXISTS _compact")
+
+    stats = {
+        "snapshots_before": before,
+        "snapshots_after": _snapshot_count(con),
+        "expired": expired,
+        "merged": merged,
+        "cleaned": cleaned,
+        "orphaned": orphaned,
+    }
+    logger.info("compact: %s", stats)
+    return stats
+
+
 def _table_exists(con: duckdb.DuckDBPyConnection, name: str) -> bool:
     row = con.execute(
         "SELECT count(*) FROM information_schema.tables WHERE table_name = ?",

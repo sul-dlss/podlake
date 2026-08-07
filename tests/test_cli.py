@@ -165,6 +165,16 @@ def test_status_errors_when_lake_exists_but_unreadable(tmp_path, monkeypatch):
     assert "never synced" not in result.output
 
 
+def test_compact_dry_run_command(tmp_path, monkeypatch):
+    monkeypatch.setenv("PODLAKE_PROFILE", "file")
+    monkeypatch.setenv("PODLAKE_CATALOG", str(tmp_path / "podlake.ducklake"))
+    monkeypatch.setenv("PODLAKE_DATA_PATH", str(tmp_path / "data") + "/")
+
+    result = runner.invoke(app, ["compact", "--dry-run"])
+    assert result.exit_code == 0, result.output
+    assert "dry run" in result.output
+
+
 def test_sync_loads_into_lake(tmp_path, monkeypatch):
     _patch(monkeypatch)
     monkeypatch.setenv("PODLAKE_PROFILE", "file")
