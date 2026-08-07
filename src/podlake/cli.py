@@ -100,16 +100,26 @@ def status(
         raise typer.Exit(code=1)
 
     cursors = _load_cursors(config)
+    total_done = total_pending = done_bytes = pending_bytes = 0
     for name, url in sorted(found.items()):
         cursor = cursors.get(name)
         resources = resourcesync.get_resources(url)
         pending = [r for r in resources if cursor is None or r.lastmod > cursor]
         done = len(resources) - len(pending)
-        pending_size = humanize.naturalsize(sum(r.length for r in pending))
+        org_all_bytes = sum(r.length for r in resources)
+        org_pending_bytes = sum(r.length for r in pending)
+
+        total_done += done
+        total_pending += len(pending)
+        done_bytes += org_all_bytes - org_pending_bytes
+        pending_bytes += org_pending_bytes
+
         when = cursor.date().isoformat() if cursor else "never synced"
         print(
             f"- [bold]{name}[/bold]: {done} processed, "
-            f"{len(pending)} pending ({pending_size}); cursor {when}"
+            f"{len(pending)} pending ({humanize.naturalsize(org_pending_bytes)}), "
+            f"{_pct(org_all_bytes - org_pending_bytes, org_all_bytes)} by size; "
+            f"cursor {when}"
         )
         if list_files or org_name:
             for r in resources:
@@ -120,6 +130,20 @@ def status(
                     f"    {mark} {r.lastmod.date().isoformat()}  {r.kind:<7} "
                     f"{humanize.naturalsize(r.length):>10}  {name_only}"
                 )
+
+    if len(found) > 1:
+        print(
+            f"[bold]total[/bold]: {total_done} processed, "
+            f"{total_pending} pending ({humanize.naturalsize(pending_bytes)}), "
+            f"{_pct(done_bytes, done_bytes + pending_bytes)} by size"
+        )
+
+
+def _pct(done_bytes: int, total_bytes: int) -> str:
+    """Percent of bytes processed, floored so it reads 100% only when truly done."""
+    if total_bytes == 0:
+        return "100%"
+    return f"{int(100 * done_bytes / total_bytes)}%"
 
 
 def _load_cursors(config: Config) -> dict:

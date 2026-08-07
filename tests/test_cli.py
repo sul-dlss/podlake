@@ -131,6 +131,25 @@ def test_status_reports_pending_then_processed(tmp_path, monkeypatch):
     assert "0 pending" in after.output
 
 
+def test_status_totals_and_percent_across_orgs(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        resourcesync,
+        "get_streams",
+        lambda name=None: {"brown": f"{BASE}/rl", "cornell": f"{BASE}/rl"},
+    )
+    monkeypatch.setattr(resourcesync, "get_resources", lambda url: _resources())
+    monkeypatch.setenv("PODLAKE_PROFILE", "file")
+    monkeypatch.setenv("PODLAKE_CATALOG", str(tmp_path / "podlake.ducklake"))
+    monkeypatch.setenv("PODLAKE_DATA_PATH", str(tmp_path / "data") + "/")
+
+    result = runner.invoke(app, ["status"])
+    assert result.exit_code == 0, result.output
+    # 2 orgs x 3 resources, none synced -> total 6 pending, 0% done by size
+    assert "total" in result.output
+    assert "6 pending" in result.output
+    assert "0% by size" in result.output
+
+
 def test_status_errors_when_lake_exists_but_unreadable(tmp_path, monkeypatch):
     _patch(monkeypatch)
     monkeypatch.setenv("PODLAKE_PROFILE", "file")
