@@ -305,7 +305,11 @@ def sync_all(
 
 def _setup_logging(verbose: bool) -> None:
     if verbose:
-        logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s")
+        # force=True so we reconfigure even if a dependency already set up the
+        # root logger (otherwise basicConfig is a silent no-op and no INFO shows)
+        logging.basicConfig(
+            level=logging.INFO, format="%(asctime)s  %(message)s", force=True
+        )
 
 
 def _sync_org(
