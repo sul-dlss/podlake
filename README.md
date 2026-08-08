@@ -156,17 +156,20 @@ $ uvx podlake sync-all           # every organization, one at a time
 ```
 
 The **first run does the full initial load; later runs apply only new deltas** —
-one command for both. Each resource is applied in its own transaction (one
-DuckLake snapshot) and advances the org's cursor, so an interrupted sync resumes
-cleanly. Run `sync-all` on a schedule (cron, a systemd timer, a Kubernetes
-CronJob, GitHub Actions) to keep the lake current. Lower `--batch-size` (default
-100000) on memory-constrained machines.
+one command for both. A resource is applied in **batches of `--batch-size`
+records** (default 100000), each its own transaction/DuckLake snapshot; the org
+cursor advances only after the last batch, so an interrupted sync re-applies
+that resource idempotently on the next run. Run `sync-all` on a schedule (cron,
+a systemd timer, a Kubernetes CronJob, GitHub Actions) to keep the lake current.
 
-Merging a large resource into the lake can be memory-hungry. Set
-`PODLAKE_MEMORY_LIMIT` (e.g. `10GB` on a 16GB box) to cap DuckDB's RAM — past
-the limit it spills to disk rather than risking the OOM killer. The spill (and
-each resource's download/conversion) goes to `$TMPDIR`, so point that at a roomy
-volume if your default temp dir is small.
+**Memory.** Peak memory during a load is bounded by one batch, so `--batch-size`
+is the lever: a DuckLake insert's working memory scales with the batch and is
+**not** capped by `PODLAKE_MEMORY_LIMIT`, so **lower `--batch-size` (e.g. 25000–
+50000) if a large full dump still pushes memory too high.** `PODLAKE_MEMORY_LIMIT`
+separately caps DuckDB's buffer pool (which spills to disk past the limit) — set
+it a few GB below total RAM for headroom. Both the spill and each resource's
+download/conversion use `$TMPDIR`, so point that at a roomy volume if the default
+temp dir is small.
 
 **Compact** reclaims disk. DuckLake is merge-on-read, so every delta, delete,
 and re-imported full dump leaves superseded rows and tombstoned files on disk

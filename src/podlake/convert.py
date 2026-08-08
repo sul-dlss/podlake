@@ -95,6 +95,75 @@ def dump_to_parquet(
     return records_out, meta_out
 
 
+def dump_to_parquet_batches(
+    org: str,
+    marcxml_path: Path,
+    out_dir: Path,
+    batch_size: int = 100_000,
+    on_record=None,
+    limit: int | None = None,
+) -> Iterator[tuple[Path, Path]]:
+    """
+    Like `dump_to_parquet`, but yield a sequence of (records_part, meta_part)
+    Parquet pairs, each holding up to `batch_size` records, written under
+    `out_dir`. This lets the caller apply a huge dump to the lake one bounded
+    batch at a time — each in its own transaction — so peak memory stays flat
+    regardless of dump size. A record is never split across parts.
+    """
+    out_dir = Path(out_dir)
+    rbuf: dict[str, list] = {name: [] for name in RECORDS_SCHEMA.names}
+    mbuf: dict[str, list] = {name: [] for name in META_SCHEMA.names}
+    count = 0
+    in_part = 0
+    part_idx = 0
+    for record in _iter_marcxml_records(marcxml_path):
+        if limit is not None and count >= limit:
+            break
+        result = record_to_rows(org, record)
+        if result is None:
+            continue
+        eav_rows, meta_row = result
+        for row in eav_rows:
+            for name in RECORDS_SCHEMA.names:
+                rbuf[name].append(row[name])
+        for name in META_SCHEMA.names:
+            mbuf[name].append(meta_row[name])
+
+        count += 1
+        in_part += 1
+        if on_record:
+            on_record(count)
+        if in_part >= batch_size:
+            yield _write_part(out_dir, part_idx, rbuf, mbuf)
+            part_idx += 1
+            in_part = 0
+
+    if in_part > 0:
+        yield _write_part(out_dir, part_idx, rbuf, mbuf)
+
+
+def _write_part(
+    out_dir: Path, idx: int, rbuf: dict[str, list], mbuf: dict[str, list]
+) -> tuple[Path, Path]:
+    records_part = out_dir / f"records.{idx:05d}.parquet"
+    meta_part = out_dir / f"meta.{idx:05d}.parquet"
+    with pq.ParquetWriter(
+        str(records_part), RECORDS_SCHEMA, compression="snappy"
+    ) as writer:
+        writer.write_table(
+            pa.table({n: rbuf[n] for n in RECORDS_SCHEMA.names}, schema=RECORDS_SCHEMA)
+        )
+    with pq.ParquetWriter(str(meta_part), META_SCHEMA, compression="snappy") as writer:
+        writer.write_table(
+            pa.table({n: mbuf[n] for n in META_SCHEMA.names}, schema=META_SCHEMA)
+        )
+    for n in RECORDS_SCHEMA.names:
+        rbuf[n].clear()
+    for n in META_SCHEMA.names:
+        mbuf[n].clear()
+    return records_part, meta_part
+
+
 def _flush(writer: pq.ParquetWriter, schema: pa.Schema, buf: dict[str, list]) -> None:
     if not buf[schema.names[0]]:
         return

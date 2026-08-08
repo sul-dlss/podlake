@@ -10,7 +10,7 @@ from tqdm import tqdm
 
 from podlake import lake, resourcesync
 from podlake.config import Config, get_config
-from podlake.convert import dump_to_parquet
+from podlake.convert import dump_to_parquet, dump_to_parquet_batches
 
 app = typer.Typer()
 
@@ -331,30 +331,44 @@ def _sync_org(
                     fixity=resource.fixity,
                     desc=f"{pos} {org} {resource.kind}: downloading",
                 )
-                records_pq = Path(tmp) / "records.parquet"
-                meta_pq = Path(tmp) / "meta.parquet"
+                # Stream the dump into batch_size-record Parquet parts and apply
+                # each in its own transaction, so peak memory is bounded by one
+                # batch (not the whole dump — DuckLake's insert memory isn't
+                # capped by memory_limit). The cursor is advanced only after the
+                # last batch, so an interrupted resource re-applies idempotently.
+                parts_dir = Path(tmp) / "parts"
+                parts_dir.mkdir()
+                changed = 0
+                started = False
                 with tqdm(
                     desc=f"{pos} {org} {resource.kind}", unit=" records", smoothing=0.01
                 ) as progress:
-                    dump_to_parquet(
+                    for records_part, meta_part in dump_to_parquet_batches(
                         org,
                         dl_path,
-                        records_pq,
-                        meta_pq,
+                        parts_dir,
                         batch_size=batch_size,
                         on_record=lambda _: progress.update(1),
                         limit=limit,
-                    )
-                # apply_resource runs a delete+insert upsert with no progress of
-                # its own; announce it so the wait isn't mistaken for a stall.
-                typer.echo(
-                    f"  {pos} {org} {resource.kind}: updating the lake with "
-                    f"{progress.n:,} records…",
-                    err=True,
-                )
-                changed, _ = lake.apply_resource(
-                    con, org, resource.kind, (records_pq, meta_pq), resource.lastmod
-                )
+                    ):
+                        # A full dump replaces the org (dropping records gone
+                        # upstream). Do it lazily on the first real batch so an
+                        # empty dump can't wipe the org.
+                        if resource.kind == "full" and not started:
+                            lake.replace_partition(con, org)
+                        started = True
+                        if resource.kind == "full":
+                            changed += lake.apply_insert_batch(
+                                con, org, records_part, meta_part
+                            )
+                        else:
+                            changed += lake.apply_upsert_batch(
+                                con, org, records_part, meta_part
+                            )
+                        records_part.unlink()
+                        meta_part.unlink()
+                        progress.set_postfix_str(f"{changed:,} into the lake")
+                lake.set_cursor(con, org, resource.lastmod)
                 total_changed += changed
     return total_changed, total_deleted, total
 

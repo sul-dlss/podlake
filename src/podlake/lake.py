@@ -274,6 +274,107 @@ def apply_resource(
     return changed_count, deleted_count
 
 
+# --- chunked apply ----------------------------------------------------------
+#
+# `apply_resource` applies a whole resource in one transaction, which is fine
+# for small resources but uses memory proportional to the resource size (the
+# DuckLake insert's working memory is *not* bounded by DuckDB's memory_limit).
+# For large full dumps / deltas the sync path instead streams the resource into
+# `batch_size`-record Parquet parts (convert.dump_to_parquet_batches) and calls
+# these one batch at a time, advancing the cursor only once all batches land.
+
+
+def replace_partition(con: duckdb.DuckDBPyConnection, org: str) -> None:
+    """
+    Delete all of an org's rows (both tables) in one transaction. Used before
+    reloading a full dump so records dropped upstream don't linger, and so the
+    batched insert that follows can skip per-batch deletes entirely.
+    """
+    ensure_schema(con)
+    con.execute("BEGIN TRANSACTION")
+    try:
+        con.execute(f"DELETE FROM {RECORDS_TABLE} WHERE org = ?", [org])
+        con.execute(f"DELETE FROM {META_TABLE} WHERE org = ?", [org])
+        con.execute("COMMIT")
+    except Exception:
+        con.execute("ROLLBACK")
+        raise
+
+
+def apply_insert_batch(
+    con: duckdb.DuckDBPyConnection, org: str, records_pq: Path, meta_pq: Path
+) -> int:
+    """Insert one batch (no delete) in its own transaction. Returns records inserted."""
+    ensure_schema(con)
+    con.execute("BEGIN TRANSACTION")
+    try:
+        con.execute(
+            f"INSERT INTO {RECORDS_TABLE} SELECT * FROM read_parquet(?)",
+            [str(records_pq)],
+        )
+        con.execute(
+            f"INSERT INTO {META_TABLE} SELECT * FROM read_parquet(?)", [str(meta_pq)]
+        )
+        con.execute("COMMIT")
+    except Exception:
+        con.execute("ROLLBACK")
+        raise
+    row = con.execute("SELECT count(*) FROM read_parquet(?)", [str(meta_pq)]).fetchone()
+    return row[0] if row else 0
+
+
+def apply_upsert_batch(
+    con: duckdb.DuckDBPyConnection, org: str, records_pq: Path, meta_pq: Path
+) -> int:
+    """
+    Upsert one batch — delete the batch's ids (org-scoped) then insert — in its
+    own transaction. Returns records upserted.
+    """
+    ensure_schema(con)
+    ids = "(SELECT pod_record_id FROM read_parquet(?))"
+    con.execute("BEGIN TRANSACTION")
+    try:
+        con.execute(
+            f"DELETE FROM {RECORDS_TABLE} WHERE org = ? AND pod_record_id IN {ids}",
+            [org, str(meta_pq)],
+        )
+        con.execute(
+            f"DELETE FROM {META_TABLE} WHERE org = ? AND pod_record_id IN {ids}",
+            [org, str(meta_pq)],
+        )
+        con.execute(
+            f"INSERT INTO {RECORDS_TABLE} SELECT * FROM read_parquet(?)",
+            [str(records_pq)],
+        )
+        con.execute(
+            f"INSERT INTO {META_TABLE} SELECT * FROM read_parquet(?)", [str(meta_pq)]
+        )
+        con.execute("COMMIT")
+    except Exception:
+        con.execute("ROLLBACK")
+        raise
+    row = con.execute("SELECT count(*) FROM read_parquet(?)", [str(meta_pq)]).fetchone()
+    return row[0] if row else 0
+
+
+def set_cursor(
+    con: duckdb.DuckDBPyConnection, org: str, last_modified: datetime
+) -> None:
+    """
+    Advance the org's sync cursor in its own transaction. Call once after all of
+    a resource's batches have been applied, so an interrupted resource (cursor
+    not yet advanced) is re-processed idempotently on the next sync.
+    """
+    ensure_state_table(con)
+    con.execute("BEGIN TRANSACTION")
+    try:
+        _set_cursor(con, org, last_modified)
+        con.execute("COMMIT")
+    except Exception:
+        con.execute("ROLLBACK")
+        raise
+
+
 def publish(config: Config, dest_uri: str) -> tuple[str, str, int, int]:
     """
     Publish a file-catalog lake to an S3 bucket so read-only consumers can

@@ -4,7 +4,7 @@ import gzip
 import duckdb
 from typer.testing import CliRunner
 
-from podlake import lake, resourcesync
+from podlake import convert, lake, resourcesync
 from podlake.cli import app
 from podlake.config import get_config
 from podlake.resourcesync import Resource
@@ -173,6 +173,47 @@ def test_compact_dry_run_command(tmp_path, monkeypatch):
     result = runner.invoke(app, ["compact", "--dry-run"])
     assert result.exit_code == 0, result.output
     assert "dry run" in result.output
+
+
+def test_dump_to_parquet_batches_splits_by_record(tmp_path):
+    xml = tmp_path / "dump.xml"
+    xml.write_text('<?xml version="1.0"?>' + COLLECTION)
+    out = tmp_path / "parts"
+    out.mkdir()
+    parts = list(convert.dump_to_parquet_batches("brown", xml, out, batch_size=1))
+    assert len(parts) == 2  # 2 records, one per batch
+    con = duckdb.connect()
+    for records_part, meta_part in parts:
+        # each part is exactly one record — never split across parts
+        assert con.execute(
+            f"SELECT count(*) FROM read_parquet('{meta_part}')"
+        ).fetchone() == (1,)
+        assert con.execute(
+            f"SELECT count(DISTINCT pod_record_id) FROM read_parquet('{records_part}')"
+        ).fetchone() == (1,)
+    con.close()
+
+
+def test_sync_chunked_batches(tmp_path, monkeypatch):
+    _patch(monkeypatch)
+    monkeypatch.setenv("PODLAKE_PROFILE", "file")
+    monkeypatch.setenv("PODLAKE_CATALOG", str(tmp_path / "podlake.ducklake"))
+    monkeypatch.setenv("PODLAKE_DATA_PATH", str(tmp_path / "data") + "/")
+
+    # --batch-size 1 forces the full + delta to apply one record per transaction
+    result = runner.invoke(app, ["sync", "brown", "--batch-size", "1"])
+    assert result.exit_code == 0, result.output
+
+    con = lake.connect(read_only=True, config=get_config())
+    ids = [
+        r[0]
+        for r in con.execute(
+            "SELECT pod_record_id FROM record_meta ORDER BY pod_record_id"
+        ).fetchall()
+    ]
+    # full+delta load a1,a2 across multiple batches; the deletes file removes a2
+    assert ids == ["brown:a1"]
+    con.close()
 
 
 def test_sync_loads_into_lake(tmp_path, monkeypatch):
