@@ -1,6 +1,7 @@
 import logging
 import sys
 import tempfile
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -284,6 +285,23 @@ def apply_resource(
 # these one batch at a time, advancing the cursor only once all batches land.
 
 
+def _timed(
+    con: duckdb.DuckDBPyConnection, label: str, sql: str, params: list | None = None
+) -> None:
+    """
+    Run one statement, logging "→ label" before and "← label (Ns)" after, so with
+    `--verbose` the last unmatched "→" printed before a stall/OOM names the exact
+    statement that's slow or memory-hungry.
+    """
+    logger.info("→ %s", label)
+    start = time.perf_counter()
+    if params is not None:
+        con.execute(sql, params)
+    else:
+        con.execute(sql)
+    logger.info("← %s (%.1fs)", label, time.perf_counter() - start)
+
+
 def replace_partition(con: duckdb.DuckDBPyConnection, org: str) -> None:
     """
     Delete all of an org's rows (both tables) in one transaction. Used before
@@ -293,9 +311,19 @@ def replace_partition(con: duckdb.DuckDBPyConnection, org: str) -> None:
     ensure_schema(con)
     con.execute("BEGIN TRANSACTION")
     try:
-        con.execute(f"DELETE FROM {RECORDS_TABLE} WHERE org = ?", [org])
-        con.execute(f"DELETE FROM {META_TABLE} WHERE org = ?", [org])
-        con.execute("COMMIT")
+        _timed(
+            con,
+            f"{org} full: clear records",
+            f"DELETE FROM {RECORDS_TABLE} WHERE org = ?",
+            [org],
+        )
+        _timed(
+            con,
+            f"{org} full: clear record_meta",
+            f"DELETE FROM {META_TABLE} WHERE org = ?",
+            [org],
+        )
+        _timed(con, f"{org} full: clear commit", "COMMIT")
     except Exception:
         con.execute("ROLLBACK")
         raise
@@ -308,14 +336,19 @@ def apply_insert_batch(
     ensure_schema(con)
     con.execute("BEGIN TRANSACTION")
     try:
-        con.execute(
+        _timed(
+            con,
+            f"{org} insert: records",
             f"INSERT INTO {RECORDS_TABLE} SELECT * FROM read_parquet(?)",
             [str(records_pq)],
         )
-        con.execute(
-            f"INSERT INTO {META_TABLE} SELECT * FROM read_parquet(?)", [str(meta_pq)]
+        _timed(
+            con,
+            f"{org} insert: record_meta",
+            f"INSERT INTO {META_TABLE} SELECT * FROM read_parquet(?)",
+            [str(meta_pq)],
         )
-        con.execute("COMMIT")
+        _timed(con, f"{org} insert: commit", "COMMIT")
     except Exception:
         con.execute("ROLLBACK")
         raise
@@ -334,22 +367,31 @@ def apply_upsert_batch(
     ids = "(SELECT pod_record_id FROM read_parquet(?))"
     con.execute("BEGIN TRANSACTION")
     try:
-        con.execute(
+        _timed(
+            con,
+            f"{org} upsert: delete records",
             f"DELETE FROM {RECORDS_TABLE} WHERE org = ? AND pod_record_id IN {ids}",
             [org, str(meta_pq)],
         )
-        con.execute(
+        _timed(
+            con,
+            f"{org} upsert: delete record_meta",
             f"DELETE FROM {META_TABLE} WHERE org = ? AND pod_record_id IN {ids}",
             [org, str(meta_pq)],
         )
-        con.execute(
+        _timed(
+            con,
+            f"{org} upsert: insert records",
             f"INSERT INTO {RECORDS_TABLE} SELECT * FROM read_parquet(?)",
             [str(records_pq)],
         )
-        con.execute(
-            f"INSERT INTO {META_TABLE} SELECT * FROM read_parquet(?)", [str(meta_pq)]
+        _timed(
+            con,
+            f"{org} upsert: insert record_meta",
+            f"INSERT INTO {META_TABLE} SELECT * FROM read_parquet(?)",
+            [str(meta_pq)],
         )
-        con.execute("COMMIT")
+        _timed(con, f"{org} upsert: commit", "COMMIT")
     except Exception:
         con.execute("ROLLBACK")
         raise

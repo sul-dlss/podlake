@@ -1,3 +1,4 @@
+import logging
 import tempfile
 from pathlib import Path
 from typing import Annotated
@@ -229,12 +230,22 @@ def sync(
         int | None,
         typer.Option(help="Limit records per resource (useful for testing)"),
     ] = None,
+    verbose: Annotated[
+        bool,
+        typer.Option(
+            "--verbose",
+            "-v",
+            help="Log each load step (delete/insert/commit) with timings, to "
+            "isolate slow or memory-heavy stages.",
+        ),
+    ] = False,
 ):
     """
     Sync one organization from POD ResourceSync into the DuckLake. Processes
     every resource (full dump + deltas + deletes) newer than the org's cursor:
     the first run does a full initial load, later runs apply only new deltas.
     """
+    _setup_logging(verbose)
     get_config()
     found = resourcesync.get_streams(org_name)
     if not found:
@@ -262,12 +273,22 @@ def sync_all(
             "peak memory on constrained machines."
         ),
     ] = 100_000,
+    verbose: Annotated[
+        bool,
+        typer.Option(
+            "--verbose",
+            "-v",
+            help="Log each load step (delete/insert/commit) with timings, to "
+            "isolate slow or memory-heavy stages.",
+        ),
+    ] = False,
 ):
     """
     Sync every organization from POD ResourceSync into the DuckLake, one at a
     time. Each resource is its own transaction (DuckLake snapshot), so an
     interrupted run resumes cleanly from where it left off.
     """
+    _setup_logging(verbose)
     get_config()
 
     con = lake.connect(read_only=False)
@@ -280,6 +301,11 @@ def sync_all(
             )
     finally:
         con.close()
+
+
+def _setup_logging(verbose: bool) -> None:
+    if verbose:
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s")
 
 
 def _sync_org(
