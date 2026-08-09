@@ -209,7 +209,8 @@ def compact(
         )
     else:
         print(
-            f"snapshots {s['snapshots_before']} → {s['snapshots_after']}; "
+            f"snapshots {s['snapshots_before']} → {s['snapshots_after']} "
+            f"in {s['passes']} pass(es); "
             f"expired {s['expired']}, merged {s['merged']}, "
             f"deleted {s['cleaned']} old + {s['orphaned']} orphaned data files"
         )
@@ -229,6 +230,16 @@ def sync(
         int | None,
         typer.Option(help="Limit records per resource (useful for testing)"),
     ] = None,
+    compact_threshold: Annotated[
+        int,
+        typer.Option(
+            "--compact-threshold",
+            help="Compact the lake mid-sync whenever the records table exceeds "
+            "this many data+delete files (0 disables). A scattered delta's DELETE "
+            "memory scales with the files it touches, so holding the file count "
+            "down keeps per-delta deletes bounded on large partitions.",
+        ),
+    ] = 1000,
 ):
     """
     Sync one organization from POD ResourceSync into the DuckLake. Processes
@@ -244,7 +255,9 @@ def sync(
     con = lake.connect(read_only=False)
     try:
         for name, url in found.items():
-            changed, deleted, n = _sync_org(con, name, url, batch_size, limit)
+            changed, deleted, n = _sync_org(
+                con, name, url, batch_size, limit, compact_threshold
+            )
             print(
                 f"[bold]{name}[/bold]: {n} resources processed, "
                 f"{changed} changed, {deleted} deleted"
@@ -262,6 +275,16 @@ def sync_all(
             "peak memory on constrained machines."
         ),
     ] = 100_000,
+    compact_threshold: Annotated[
+        int,
+        typer.Option(
+            "--compact-threshold",
+            help="Compact the lake mid-sync whenever the records table exceeds "
+            "this many data+delete files (0 disables). A scattered delta's DELETE "
+            "memory scales with the files it touches, so holding the file count "
+            "down keeps per-delta deletes bounded on large partitions.",
+        ),
+    ] = 1000,
 ):
     """
     Sync every organization from POD ResourceSync into the DuckLake, one at a
@@ -273,7 +296,9 @@ def sync_all(
     con = lake.connect(read_only=False)
     try:
         for name, url in sorted(resourcesync.get_streams().items()):
-            changed, deleted, n = _sync_org(con, name, url, batch_size, None)
+            changed, deleted, n = _sync_org(
+                con, name, url, batch_size, None, compact_threshold
+            )
             print(
                 f"[bold]{name}[/bold]: {n} resources processed, "
                 f"{changed} changed, {deleted} deleted"
@@ -282,12 +307,47 @@ def sync_all(
         con.close()
 
 
+def _maybe_compact(
+    con: duckdb.DuckDBPyConnection, org: str, pos: str, threshold: int
+) -> None:
+    """
+    Report the records table's live file count and, if it's over `threshold`
+    (0 disables), compact the lake to a fixed point before the next resource's
+    DELETE. Fragmentation rebuilds within a sync — every delta adds data and
+    delete files — and a scattered DELETE's memory scales with the files it
+    touches, so this keeps per-delta deletes bounded on large partitions.
+    """
+    counts = lake.table_file_counts(con)
+    rec_data, rec_del = counts.get(lake.RECORDS_TABLE, (0, 0))
+    meta_data, meta_del = counts.get(lake.META_TABLE, (0, 0))
+    total = rec_data + rec_del
+    typer.echo(
+        f"  {pos} {org}: files — {lake.RECORDS_TABLE} {rec_data} data + "
+        f"{rec_del} delete, {lake.META_TABLE} {meta_data} data + {meta_del} delete",
+        err=True,
+    )
+    if not threshold or total < threshold:
+        return
+    typer.echo(
+        f"  {pos} {org}: {total} records files ≥ threshold {threshold}, compacting…",
+        err=True,
+    )
+    s = lake.compact(con, days=0)
+    after_data, after_del = lake.table_file_counts(con).get(lake.RECORDS_TABLE, (0, 0))
+    typer.echo(
+        f"  {pos} {org}: compacted in {s['passes']} pass(es) → "
+        f"{after_data} data + {after_del} delete files",
+        err=True,
+    )
+
+
 def _sync_org(
     con: duckdb.DuckDBPyConnection,
     org: str,
     resourcelist_url: str,
     batch_size: int,
     limit: int | None,
+    compact_threshold: int,
 ) -> tuple[int, int, int]:
     cursor = lake.get_cursor(con, org)
     resources = resourcesync.get_resources(resourcelist_url)
@@ -300,6 +360,10 @@ def _sync_org(
             f"{org}: {total} resource{'' if total == 1 else 's'} to sync ({size})",
             err=True,
         )
+        # Start from a compacted base so even the first resource's DELETE runs
+        # against a low file count (the lake may be fragmented from a prior sync
+        # that never compacted).
+        _maybe_compact(con, org, "[pre]", compact_threshold)
 
     total_changed = total_deleted = 0
     for i, resource in enumerate(pending, 1):
@@ -356,6 +420,7 @@ def _sync_org(
                     con, org, resource.kind, (records_pq, meta_pq), resource.lastmod
                 )
                 total_changed += changed
+        _maybe_compact(con, org, pos, compact_threshold)
     return total_changed, total_deleted, total
 
 

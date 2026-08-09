@@ -194,3 +194,25 @@ def test_sync_loads_into_lake(tmp_path, monkeypatch):
     ]
     assert ids == ["brown:a1"]
     con.close()
+
+
+def test_sync_with_compact_threshold(tmp_path, monkeypatch):
+    _patch(monkeypatch)
+    monkeypatch.setenv("PODLAKE_PROFILE", "file")
+    monkeypatch.setenv("PODLAKE_CATALOG", str(tmp_path / "podlake.ducklake"))
+    monkeypatch.setenv("PODLAKE_DATA_PATH", str(tmp_path / "data") + "/")
+
+    # a threshold of 1 exercises the per-resource compaction path; the sync must
+    # still complete and leave the lake correct
+    result = runner.invoke(app, ["sync", "brown", "--compact-threshold", "1"])
+    assert result.exit_code == 0, result.output
+
+    con = lake.connect(read_only=True, config=get_config())
+    ids = [
+        r[0]
+        for r in con.execute(
+            "SELECT pod_record_id FROM record_meta ORDER BY pod_record_id"
+        ).fetchall()
+    ]
+    assert ids == ["brown:a1"]
+    con.close()

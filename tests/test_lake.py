@@ -65,6 +65,33 @@ def _write_org(tmp_path, name, records):
     return rpq, mpq
 
 
+def _bulk_pair(tmp_path, name, title, n=20000):
+    """A records+meta pair big enough to write real Parquet files (not inlined)."""
+    src = duckdb.connect()
+    src.execute(
+        "CREATE TABLE t (org VARCHAR, pod_record_id VARCHAR, field_tag VARCHAR, "
+        "field_seq INTEGER, ind1 VARCHAR, ind2 VARCHAR, subfield_code VARCHAR, "
+        "subfield_seq INTEGER, value VARCHAR)"
+    )
+    src.execute(
+        "INSERT INTO t SELECT 'stanford', 'stanford:' || i, '245', 1, '1', '0', "
+        f"'a', 0, '{title} ' || i FROM range({n}) tbl(i)"
+    )
+    src.execute(
+        "CREATE TABLE m (org VARCHAR, pod_record_id VARCHAR, goldrush_key VARCHAR)"
+    )
+    src.execute(
+        "INSERT INTO m SELECT 'stanford', 'stanford:' || i, 'k' || i "
+        f"FROM range({n}) tbl(i)"
+    )
+    rpq = tmp_path / f"{name}.records.parquet"
+    mpq = tmp_path / f"{name}.meta.parquet"
+    src.execute(f"COPY t TO '{rpq}' (FORMAT parquet)")
+    src.execute(f"COPY m TO '{mpq}' (FORMAT parquet)")
+    src.close()
+    return rpq, mpq
+
+
 def test_load_pair_and_overlap(tmp_path):
     con = lake.connect(read_only=False, config=_dev_config(tmp_path))
 
@@ -375,5 +402,49 @@ def test_compact_dry_run_changes_nothing(tmp_path):
         stats = lake.compact(con, days=0, dry_run=True)
         assert stats["snapshots_after"] == stats["snapshots_before"]
         assert stats["merged"] == 0
+        assert stats["passes"] == 1  # dry run never loops
+    finally:
+        con.close()
+
+
+def test_table_file_counts(tmp_path):
+    con = lake.connect(read_only=False, config=_dev_config(tmp_path))
+    try:
+        r, m = _bulk_pair(tmp_path, "full", "One")
+        lake.load_pair(con, "stanford", r, m)
+        counts = lake.table_file_counts(con)
+        assert {"records", "record_meta"} <= set(counts)
+        rec_data, _rec_del = counts["records"]
+        assert rec_data >= 1  # real data files were written, not inlined
+    finally:
+        con.close()
+
+
+def test_compact_converges_to_fixed_point(tmp_path):
+    con = lake.connect(read_only=False, config=_dev_config(tmp_path))
+    try:
+        r, m = _bulk_pair(tmp_path, "full", "One")
+        lake.load_pair(con, "stanford", r, m)
+        # a full re-import supersedes every record, leaving dead files to reclaim
+        r, m = _bulk_pair(tmp_path, "reimport", "Two")
+        lake.apply_resource(
+            con, "stanford", "delta", (r, m), datetime(2026, 3, 1, tzinfo=UTC)
+        )
+
+        first = lake.compact(con, days=0)
+        assert first["passes"] >= 1
+
+        # a second compact finds the fixed point immediately: one pass, no reclaim
+        again = lake.compact(con, days=0)
+        assert again["passes"] == 1
+        assert (
+            again["expired"]
+            == again["merged"]
+            == again["cleaned"]
+            == again["orphaned"]
+            == 0
+        )
+        # data intact through both compactions
+        assert con.execute("SELECT count(*) FROM record_meta").fetchone() == (20000,)
     finally:
         con.close()

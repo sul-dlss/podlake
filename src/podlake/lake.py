@@ -320,17 +320,10 @@ def _snapshot_count(con: duckdb.DuckDBPyConnection) -> int:
     return row[0] if row else 0
 
 
-def compact(
-    con: duckdb.DuckDBPyConnection, *, days: int = 0, dry_run: bool = False
+def _compact_pass(
+    con: duckdb.DuckDBPyConnection, *, days: int, dry_run: bool
 ) -> dict[str, int]:
-    """
-    Reclaim disk in the attached lake. DuckLake is merge-on-read, so superseded
-    rows — from deltas/deletes and re-imported full dumps — pile up on disk until
-    this runs. It expires snapshots older than `days` days (0 = all but the
-    current), compacts small Parquet files, then deletes the data files no longer
-    referenced by a live snapshot. With dry_run=True nothing changes and the
-    counts report what *would* be reclaimed. Returns a stats dict.
-    """
+    """One expire → merge → cleanup cycle. Returns the four reclaim counts."""
     dry = "true" if dry_run else "false"
     older_than = f"now() - INTERVAL '{int(days)} days'"
 
@@ -343,7 +336,6 @@ def compact(
         row = con.execute("SELECT count(*) FROM _compact").fetchone()
         return row[0] if row else 0
 
-    before = _snapshot_count(con)
     expired = run(
         f"ducklake_expire_snapshots('{LAKE_ALIAS}', "
         f"dry_run => {dry}, older_than => {older_than})"
@@ -359,17 +351,68 @@ def compact(
         f"dry_run => {dry}, cleanup_all => true)"
     )
     con.execute("DROP TABLE IF EXISTS _compact")
-
-    stats = {
-        "snapshots_before": before,
-        "snapshots_after": _snapshot_count(con),
+    return {
         "expired": expired,
         "merged": merged,
         "cleaned": cleaned,
         "orphaned": orphaned,
     }
-    logger.info("compact: %s", stats)
-    return stats
+
+
+def compact(
+    con: duckdb.DuckDBPyConnection,
+    *,
+    days: int = 0,
+    dry_run: bool = False,
+    max_passes: int = 10,
+) -> dict[str, int]:
+    """
+    Reclaim disk in the attached lake. DuckLake is merge-on-read, so superseded
+    rows — from deltas/deletes and re-imported full dumps — pile up on disk until
+    this runs. It expires snapshots older than `days` days (0 = all but the
+    current), compacts small Parquet files, then deletes the data files no longer
+    referenced by a live snapshot.
+
+    A single expire → merge → cleanup pass never fully compacts: merging creates
+    new snapshots and freshly-superseded files that only become collectable once
+    a *later* expire pass removes the snapshots referencing them. So a real run
+    repeats the cycle until a pass reclaims nothing (or `max_passes`), reaching a
+    fixed point in one call. `dry_run=True` does a single pass and changes
+    nothing, reporting what *would* be reclaimed. Returns aggregated stats,
+    including the number of `passes` run.
+    """
+    before = _snapshot_count(con)
+    totals = {"expired": 0, "merged": 0, "cleaned": 0, "orphaned": 0, "passes": 0}
+    while totals["passes"] < max_passes:
+        s = _compact_pass(con, days=days, dry_run=dry_run)
+        for k in ("expired", "merged", "cleaned", "orphaned"):
+            totals[k] += s[k]
+        totals["passes"] += 1
+        # dry runs never mutate (so looping is pointless); real runs stop once a
+        # pass leaves everything in place — the fixed point.
+        if dry_run or s["expired"] + s["merged"] + s["cleaned"] + s["orphaned"] == 0:
+            break
+
+    totals["snapshots_before"] = before
+    totals["snapshots_after"] = _snapshot_count(con)
+    logger.info("compact: %s", totals)
+    return totals
+
+
+def table_file_counts(con: duckdb.DuckDBPyConnection) -> dict[str, tuple[int, int]]:
+    """
+    Live (data_file_count, delete_file_count) per table, from DuckLake metadata.
+
+    A scattered DELETE's memory scales with the number of data (and delete) files
+    it must touch, so this is the signal a sync uses to decide when to pause and
+    compact — keeping the file count low enough that per-delta deletes stay
+    bounded. Returns {table_name: (data_files, delete_files)}.
+    """
+    rows = con.execute(
+        "SELECT table_name, file_count, delete_file_count "
+        f"FROM ducklake_table_info('{LAKE_ALIAS}')"
+    ).fetchall()
+    return {name: (fc, dfc) for name, fc, dfc in rows}
 
 
 def _table_exists(con: duckdb.DuckDBPyConnection, name: str) -> bool:
