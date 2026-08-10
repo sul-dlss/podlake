@@ -1,6 +1,7 @@
 import logging
 import sys
 import tempfile
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -185,6 +186,29 @@ def _naive_utc(dt: datetime) -> datetime:
     return dt.replace(tzinfo=None)
 
 
+def _timed(
+    con: duckdb.DuckDBPyConnection,
+    label: str,
+    sql: str,
+    params: list | None = None,
+) -> None:
+    """
+    Run one statement, logging a marker before it and the elapsed time after.
+
+    `apply_resource` runs several statements (delete + insert + commit) in one
+    transaction with no progress of its own, so with `sync --verbose` these
+    boundaries show which step is executing — the last unmatched "→" before a
+    pause or memory spike pins the culprit (e.g. the DELETE vs the INSERT).
+    """
+    logger.info("→ %s", label)
+    start = time.perf_counter()
+    if params is None:
+        con.execute(sql)
+    else:
+        con.execute(sql, params)
+    logger.info("← %s (%.1fs)", label, time.perf_counter() - start)
+
+
 def apply_resource(
     con: duckdb.DuckDBPyConnection,
     org: str,
@@ -219,21 +243,29 @@ def apply_resource(
             # data to find this resource's ids — a full-table scan that is very
             # slow on a multi-org lake. Every id in the resource belongs to
             # `org`, so restricting to it is safe.
-            con.execute(
+            _timed(
+                con,
+                f"{org} {kind}: delete records",
                 f"DELETE FROM {RECORDS_TABLE} "
                 f"WHERE org = ? AND pod_record_id IN {ids_subquery}",
                 [org, str(meta_pq)],
             )
-            con.execute(
+            _timed(
+                con,
+                f"{org} {kind}: delete record_meta",
                 f"DELETE FROM {META_TABLE} "
                 f"WHERE org = ? AND pod_record_id IN {ids_subquery}",
                 [org, str(meta_pq)],
             )
-            con.execute(
+            _timed(
+                con,
+                f"{org} {kind}: insert records",
                 f"INSERT INTO {RECORDS_TABLE} SELECT * FROM read_parquet(?)",
                 [str(records_pq)],
             )
-            con.execute(
+            _timed(
+                con,
+                f"{org} {kind}: insert record_meta",
                 f"INSERT INTO {META_TABLE} SELECT * FROM read_parquet(?)",
                 [str(meta_pq)],
             )
@@ -252,12 +284,16 @@ def apply_resource(
                 con.register("delete_ids", pa.table({"pod_record_id": payload}))
                 try:
                     id_subquery = "(SELECT pod_record_id FROM delete_ids)"
-                    con.execute(
+                    _timed(
+                        con,
+                        f"{org} deletes: delete records",
                         f"DELETE FROM {RECORDS_TABLE} "
                         f"WHERE org = ? AND pod_record_id IN {id_subquery}",
                         [org],
                     )
-                    con.execute(
+                    _timed(
+                        con,
+                        f"{org} deletes: delete record_meta",
                         f"DELETE FROM {META_TABLE} "
                         f"WHERE org = ? AND pod_record_id IN {id_subquery}",
                         [org],
@@ -269,7 +305,7 @@ def apply_resource(
             raise ValueError(f"unknown resource kind: {kind}")
 
         _set_cursor(con, org, last_modified)
-        con.execute("COMMIT")
+        _timed(con, f"{org} {kind}: commit", "COMMIT")
     except Exception:
         con.execute("ROLLBACK")
         raise
