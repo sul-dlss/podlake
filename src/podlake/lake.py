@@ -45,6 +45,16 @@ def connect(
         limit = config.memory_limit.replace("'", "''")
         con.execute(f"SET memory_limit = '{limit}'")
 
+    # Store deletes as compact per-file deletion vectors (bitmaps) instead of the
+    # default separate delete files. The delete-file path's tombstone-write phase
+    # uses off-pool memory that memory_limit can't bound, so a scattered delta
+    # DELETE over a huge partition (e.g. Harvard's ~1.3B-row `records`) balloons
+    # into swap; deletion vectors are the lighter, standard merge-on-read delete.
+    # Write-side only (no-op for read-only consumers); a `compact` before
+    # `publish` bakes the deletes into clean data files for readers.
+    if not read_only:
+        con.execute("SET ducklake_write_deletion_vectors = true")
+
     # Show DuckDB's progress bar for long-running statements — notably the
     # delete+insert upsert that `apply_resource` runs after conversion — so a
     # busy apply step isn't mistaken for a hang. Only in an interactive

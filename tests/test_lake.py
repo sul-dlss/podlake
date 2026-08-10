@@ -377,3 +377,39 @@ def test_compact_dry_run_changes_nothing(tmp_path):
         assert stats["merged"] == 0
     finally:
         con.close()
+
+
+def test_write_connection_uses_deletion_vectors(tmp_path):
+    config = _dev_config(tmp_path)
+    con = lake.connect(read_only=False, config=config)
+    try:
+        # writes enable deletion vectors — the lighter merge-on-read delete
+        assert con.execute(
+            "SELECT current_setting('ducklake_write_deletion_vectors')"
+        ).fetchone() == (True,)
+        lake.ensure_schema(con)
+        # enough rows to write a real data file (not inlined)
+        con.execute(
+            "INSERT INTO records SELECT 'x', 'x:' || i, '245', 1, '1', '0', 'a', 0, "
+            "'t' || i FROM range(50000) s(i)"
+        )
+        con.execute("DELETE FROM records WHERE org = 'x' AND pod_record_id = 'x:1'")
+        # the delete is stored as a deletion vector, so no separate delete file
+        assert con.execute(
+            f"SELECT delete_file_count FROM ducklake_table_info('{lake.LAKE_ALIAS}') "
+            "WHERE table_name = 'records'"
+        ).fetchone() == (0,)
+        assert con.execute(
+            "SELECT count(*) FROM records WHERE org = 'x'"
+        ).fetchone() == (49999,)
+    finally:
+        con.close()
+
+    # read-only consumers keep the default (write-side setting only)
+    ro = lake.connect(read_only=True, config=config)
+    try:
+        assert ro.execute(
+            "SELECT current_setting('ducklake_write_deletion_vectors')"
+        ).fetchone() == (False,)
+    finally:
+        ro.close()
