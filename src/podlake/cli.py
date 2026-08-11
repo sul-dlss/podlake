@@ -413,14 +413,26 @@ def _maybe_apply_deletes(
         f"({s['rewritten']} file(s) rewritten)",
         err=True,
     )
-    # Back off if we're near the floor, so the next check has room to be useful.
+    # Back off if we're near the floor, so the next check has room to be useful —
+    # but never past `ceiling`, or a rewrite that can't keep up would quietly
+    # ratchet the trigger into the range where deltas stop fitting in memory.
     if after > limit * 0.75:
-        state["limit"] = int(after * 1.5)
+        ceiling = max_pending * 2
+        state["limit"] = min(int(after * 1.5), ceiling)
         typer.echo(
             f"  {pos} {org}: little left to reclaim at this threshold — "
             f"raising the trigger to {state['limit']:,} rows",
             err=True,
         )
+        if state["limit"] >= ceiling:
+            typer.echo(
+                f"  {pos} {org}: [warning] backlog is not being reclaimed and the "
+                f"trigger has hit its ceiling ({ceiling:,}). Deltas will get slower "
+                "and may run out of memory. Interrupt and run "
+                "`podlake compact --delete-threshold 0.05` (or lower) to clear it — "
+                "the sync resumes from where it stopped.",
+                err=True,
+            )
 
 
 def _sync_org(
