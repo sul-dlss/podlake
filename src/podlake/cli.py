@@ -65,6 +65,16 @@ def _setup_logging(verbose: bool, log: Path | None = None) -> None:
         logging.basicConfig(level=logging.INFO, format=fmt, force=True)
 
 
+def _connect_writable(config: Config | None = None) -> duckdb.DuckDBPyConnection:
+    """Open a write connection, silencing DuckDB's progress bar when --log is in
+    effect — connect() turns it on for any TTY, which would otherwise leave the
+    console noisy despite the log file."""
+    con = lake.connect(read_only=False, config=config)
+    if _LOGGING_TO_FILE:
+        con.execute("SET enable_progress_bar = false")
+    return con
+
+
 def _progress(msg: str) -> None:
     """A progress line: into the log file with --log, otherwise onto stderr."""
     if _LOGGING_TO_FILE:
@@ -297,6 +307,7 @@ def compact(
             "DuckLake version that supports max_compacted_files.)",
         ),
     ] = None,
+    log: LogFile = None,
 ):
     """
     Reclaim disk space and keep writes fast. DuckLake is merge-on-read, so
@@ -311,16 +322,19 @@ def compact(
     Merging small files does not clear it — that is what the delete-rewrite is
     for, and why it is on by default.
     """
+    _setup_logging(False, log)
     config = get_config()
-    con = lake.connect(read_only=False, config=config)
+    con = _connect_writable(config)
     try:
         if not no_rewrite_deletes and not dry_run and max_files is None:
             _, pending_rows = lake.pending_deletes(con)
             if pending_rows > BIG_DELETE_BACKLOG:
-                print(
+                _summary(
+                    f"{pending_rows:,} tombstoned rows to apply — this may take a "
+                    "long time and cannot be interrupted for partial credit",
                     f"[yellow]{pending_rows:,} tombstoned rows to apply — this may "
                     "take a long time, and cannot be interrupted for partial credit. "
-                    "Consider --max-files, or a higher --delete-threshold first.[/yellow]"
+                    "Consider --max-files, or a higher --delete-threshold first.[/yellow]",
                 )
         s = lake.compact(
             con,
@@ -333,24 +347,26 @@ def compact(
         con.close()
 
     if dry_run:
-        print(
+        line = (
             f"dry run — would expire {s['expired']} snapshot(s) and delete "
             f"{s['cleaned']} old + {s['orphaned']} orphaned data files "
             f"(snapshots stay at {s['snapshots_before']})"
         )
     else:
-        print(
+        line = (
             f"snapshots {s['snapshots_before']} → {s['snapshots_after']} "
             f"in {s['passes']} pass(es); "
             f"expired {s['expired']}, merged {s['merged']}, "
             f"deleted {s['cleaned']} old + {s['orphaned']} orphaned data files"
         )
-    print(
+    _summary(line, line)
+    backlog = (
         f"pending deletes: {s['delete_files_before']:,} files / "
         f"{s['deleted_rows_before']:,} rows → "
         f"{s['delete_files_after']:,} files / {s['deleted_rows_after']:,} rows"
         + (f" ({s['rewritten']} file(s) rewritten)" if s["rewritten"] else "")
     )
+    _summary(backlog, backlog)
 
 
 @app.command()
@@ -383,7 +399,7 @@ def sync(
         typer.echo(f"No ResourceSync stream found for {org_name}", err=True)
         raise typer.Exit(code=1)
 
-    con = lake.connect(read_only=False)
+    con = _connect_writable()
     try:
         for name, url in found.items():
             changed, deleted, n = _sync_org(
@@ -419,7 +435,7 @@ def sync_all(
     _setup_logging(verbose, log)
     get_config()
 
-    con = lake.connect(read_only=False)
+    con = _connect_writable()
     try:
         for name, url in sorted(resourcesync.get_streams().items()):
             changed, deleted, n = _sync_org(

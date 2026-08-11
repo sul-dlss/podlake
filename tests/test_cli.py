@@ -299,3 +299,36 @@ def test_delete_limit_never_below_known_floor():
     assert _delete_limit_for(big, 100_000_000, 0) == 50_000_000
     # a proven floor above the strict limit raises it rather than chasing 50M
     assert _delete_limit_for(big, 100_000_000, 76_000_000) == 76_000_000
+
+
+def test_log_silences_duckdb_progress_bar(tmp_path, monkeypatch):
+    """--log must also turn off DuckDB's own progress bar; connect() enables it
+    for any TTY, so the log file alone would not keep an interactive console
+    quiet. CliRunner is not a TTY, so assert the setting directly."""
+    monkeypatch.setenv("PODLAKE_PROFILE", "file")
+    monkeypatch.setenv("PODLAKE_CATALOG", str(tmp_path / "podlake.ducklake"))
+    monkeypatch.setenv("PODLAKE_DATA_PATH", str(tmp_path / "data") + "/")
+
+    from podlake import cli
+
+    cli._setup_logging(False, tmp_path / "x.log")
+    try:
+        con = cli._connect_writable(get_config())
+        assert con.execute(
+            "SELECT current_setting('enable_progress_bar')"
+        ).fetchone() == (False,)
+        con.close()
+    finally:
+        cli._setup_logging(False, None)
+
+
+def test_compact_supports_log(tmp_path, monkeypatch):
+    monkeypatch.setenv("PODLAKE_PROFILE", "file")
+    monkeypatch.setenv("PODLAKE_CATALOG", str(tmp_path / "podlake.ducklake"))
+    monkeypatch.setenv("PODLAKE_DATA_PATH", str(tmp_path / "data") + "/")
+    log = tmp_path / "compact.log"
+
+    result = runner.invoke(app, ["compact", "--log", str(log)])
+    assert result.exit_code == 0, result.output
+    assert result.output.strip() == ""
+    assert "pending deletes" in log.read_text()
