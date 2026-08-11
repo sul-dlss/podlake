@@ -395,18 +395,32 @@ def compact(
     # data + delete files the rewrite supersedes. No dry-run mode upstream.
     rewritten = 0
     if rewrite_deletes is not None and not dry_run:
-        args = [f"delete_threshold => {float(rewrite_deletes)}"]
-        if max_files is not None:
-            args.append(f"max_compacted_files => {int(max_files)}")
+        threshold = f"delete_threshold => {float(rewrite_deletes)}"
         logger.info(
-            "rewriting data files with >=%.0f%% deletes (%s delete files, %s rows)",
+            "rewriting data files with >=%s%% deletes (%s delete files, %s rows)",
             float(rewrite_deletes) * 100,
             f"{delete_files_before:,}",
             f"{deleted_rows_before:,}",
         )
-        rewritten = run(
-            f"ducklake_rewrite_data_files('{LAKE_ALIAS}', {', '.join(args)})"
-        )
+        fn = f"ducklake_rewrite_data_files('{LAKE_ALIAS}', {threshold}"
+        try:
+            bounded = fn + (
+                f", max_compacted_files => {int(max_files)})"
+                if max_files is not None
+                else ")"
+            )
+            rewritten = run(bounded)
+        except duckdb.Error as e:
+            # max_compacted_files was added to ducklake_rewrite_data_files after
+            # some released versions; without it the rewrite can't be bounded, so
+            # say so rather than silently doing the whole backlog in one run.
+            if max_files is None or "max_compacted_files" not in str(e):
+                raise
+            logger.warning(
+                "this DuckLake version does not support max_compacted_files — "
+                "rewriting the whole backlog in one pass (this may take a long time)"
+            )
+            rewritten = run(fn + ")")
 
     totals = {"expired": 0, "merged": 0, "cleaned": 0, "orphaned": 0, "passes": 0}
     while totals["passes"] < max_passes:
