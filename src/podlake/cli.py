@@ -64,6 +64,9 @@ def _setup_logging(verbose: bool, log: Path | None = None) -> None:
         )
     elif verbose:
         logging.basicConfig(level=logging.INFO, format=fmt, force=True)
+    # INFO on the root logger otherwise pulls in httpx's line per request, which
+    # buries our own progress under hundreds of "HTTP Request: GET ..." lines.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 def _connect_writable(config: Config | None = None) -> duckdb.DuckDBPyConnection:

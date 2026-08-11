@@ -287,6 +287,8 @@ def test_sync_log_file_quiets_console(tmp_path, monkeypatch):
     written = log.read_text()
     assert "downloading" in written
     assert "resources processed" in written
+    # httpx's per-request chatter would bury our progress lines
+    assert "HTTP Request" not in written
 
 
 def test_delete_limit_never_below_known_floor():
