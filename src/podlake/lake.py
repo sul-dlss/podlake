@@ -388,6 +388,15 @@ def compact(
         row = con.execute("SELECT count(*) FROM _compact").fetchone()
         return row[0] if row else 0
 
+    def run_rewrite(fn: str) -> int:
+        # The rewrite returns one row per table/compaction group, not per file, so
+        # count the files it actually processed rather than the result rows.
+        con.execute(f"CREATE OR REPLACE TEMP TABLE _compact AS SELECT * FROM {fn}")
+        row = con.execute(
+            "SELECT coalesce(sum(files_processed), 0) FROM _compact"
+        ).fetchone()
+        return int(row[0]) if row else 0
+
     before = _snapshot_count(con)
     delete_files_before, deleted_rows_before = pending_deletes(con)
 
@@ -409,7 +418,7 @@ def compact(
                 if max_files is not None
                 else ")"
             )
-            rewritten = run(bounded)
+            rewritten = run_rewrite(bounded)
         except duckdb.Error as e:
             # max_compacted_files was added to ducklake_rewrite_data_files after
             # some released versions; without it the rewrite can't be bounded, so
@@ -420,7 +429,7 @@ def compact(
                 "this DuckLake version does not support max_compacted_files — "
                 "rewriting the whole backlog in one pass (this may take a long time)"
             )
-            rewritten = run(fn + ")")
+            rewritten = run_rewrite(fn + ")")
 
     totals = {"expired": 0, "merged": 0, "cleaned": 0, "orphaned": 0, "passes": 0}
     while totals["passes"] < max_passes:
