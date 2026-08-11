@@ -14,6 +14,16 @@ from podlake.convert import dump_to_parquet
 
 app = typer.Typer()
 
+# Tombstoned rows a DELETE has to load before it gets uncomfortable. Every DELETE
+# loads the full delete history of each data file it opens, off-pool and not
+# bounded by memory_limit, so this — not the number of rows being deleted — is
+# what decides whether a delta fits in RAM. Measured on a 32GB box: ~105M was
+# fine, ~558M peaked at 95%. The safe ceiling scales with RAM, hence the flag.
+DEFAULT_MAX_PENDING_DELETES = 150_000_000
+
+# Backlog beyond which an unbounded rewrite is worth warning about up front.
+_BIG_DELETE_BACKLOG = 500_000_000
+
 
 @app.command()
 def config():
@@ -187,45 +197,65 @@ def compact(
             help="Report what would be reclaimed without changing anything.",
         ),
     ] = False,
-    rewrite_deletes: Annotated[
-        float | None,
+    delete_threshold: Annotated[
+        float,
         typer.Option(
-            "--rewrite-deletes",
-            help="Also rewrite data files to physically apply accumulated deletes, "
-            "for files at least this fraction deleted (e.g. 0.05 = 5%). This is the "
-            "only step that clears tombstoned rows from large files, and it keeps "
-            "later DELETEs cheap — but it rewrites real data, so it is slow. Bound "
-            "one run with --max-files and re-run to make progress incrementally.",
+            "--delete-threshold",
+            help="Rewrite data files that are at least this fraction deleted, to "
+            "physically apply their accumulated deletes (0.1 = 10%). Lower reclaims "
+            "more but costs much more per row reclaimed.",
             min=0.0,
             max=1.0,
         ),
-    ] = None,
+    ] = 0.1,
+    no_rewrite_deletes: Annotated[
+        bool,
+        typer.Option(
+            "--no-rewrite-deletes",
+            help="Skip applying accumulated deletes, for a quick disk-only pass. "
+            "Note this leaves tombstoned rows in place, which makes later DELETEs "
+            "progressively more expensive.",
+        ),
+    ] = False,
     max_files: Annotated[
         int | None,
         typer.Option(
             "--max-files",
-            help="Cap how many files --rewrite-deletes rewrites in one run, so a "
-            "huge backlog can be worked through a chunk at a time.",
+            help="Cap how many files the delete-rewrite handles in one run, so a "
+            "huge backlog can be worked through a chunk at a time. (Requires a "
+            "DuckLake version that supports max_compacted_files.)",
         ),
     ] = None,
 ):
     """
-    Reclaim disk space. DuckLake is merge-on-read, so superseded rows from
-    deltas/deletes and re-imported full dumps accumulate on disk until this runs:
-    it expires old snapshots, compacts small Parquet files, and deletes the data
-    files no longer referenced by a live snapshot.
+    Reclaim disk space and keep writes fast. DuckLake is merge-on-read, so
+    superseded rows from deltas/deletes and re-imported full dumps accumulate on
+    disk until this runs: it expires old snapshots, compacts small Parquet files,
+    applies accumulated deletes, and removes data files no longer referenced by a
+    live snapshot.
 
-    Note that compacting small files does NOT clear tombstoned rows out of large
-    data files — pass --rewrite-deletes for that.
+    Applying deletes matters for more than disk. Every DELETE loads the full
+    delete history of each data file it opens, so an unapplied backlog makes
+    deltas progressively slower and more memory-hungry until they fail outright.
+    Merging small files does not clear it — that is what the delete-rewrite is
+    for, and why it is on by default.
     """
     config = get_config()
     con = lake.connect(read_only=False, config=config)
     try:
+        if not no_rewrite_deletes and not dry_run and max_files is None:
+            _, pending_rows = lake.pending_deletes(con)
+            if pending_rows > _BIG_DELETE_BACKLOG:
+                print(
+                    f"[yellow]{pending_rows:,} tombstoned rows to apply — this may "
+                    "take a long time, and cannot be interrupted for partial credit. "
+                    "Consider --max-files, or a higher --delete-threshold first.[/yellow]"
+                )
         s = lake.compact(
             con,
             days=older_than_days,
             dry_run=dry_run,
-            rewrite_deletes=rewrite_deletes,
+            rewrite_deletes=None if no_rewrite_deletes else delete_threshold,
             max_files=max_files,
         )
     finally:
@@ -266,6 +296,16 @@ def sync(
         int | None,
         typer.Option(help="Limit records per resource (useful for testing)"),
     ] = None,
+    max_pending_deletes: Annotated[
+        int,
+        typer.Option(
+            "--max-pending-deletes",
+            help="Apply accumulated deletes mid-sync whenever the backlog exceeds "
+            "this many tombstoned rows (0 disables). Every DELETE loads the delete "
+            "history of the files it opens, so a long delta chain otherwise grows "
+            "its own memory use until it fails. Raise it on a machine with more RAM.",
+        ),
+    ] = DEFAULT_MAX_PENDING_DELETES,
 ):
     """
     Sync one organization from POD ResourceSync into the DuckLake. Processes
@@ -281,7 +321,9 @@ def sync(
     con = lake.connect(read_only=False)
     try:
         for name, url in found.items():
-            changed, deleted, n = _sync_org(con, name, url, batch_size, limit)
+            changed, deleted, n = _sync_org(
+                con, name, url, batch_size, limit, max_pending_deletes
+            )
             print(
                 f"[bold]{name}[/bold]: {n} resources processed, "
                 f"{changed} changed, {deleted} deleted"
@@ -299,6 +341,16 @@ def sync_all(
             "peak memory on constrained machines."
         ),
     ] = 100_000,
+    max_pending_deletes: Annotated[
+        int,
+        typer.Option(
+            "--max-pending-deletes",
+            help="Apply accumulated deletes mid-sync whenever the backlog exceeds "
+            "this many tombstoned rows (0 disables). Every DELETE loads the delete "
+            "history of the files it opens, so a long delta chain otherwise grows "
+            "its own memory use until it fails. Raise it on a machine with more RAM.",
+        ),
+    ] = DEFAULT_MAX_PENDING_DELETES,
 ):
     """
     Sync every organization from POD ResourceSync into the DuckLake, one at a
@@ -310,7 +362,9 @@ def sync_all(
     con = lake.connect(read_only=False)
     try:
         for name, url in sorted(resourcesync.get_streams().items()):
-            changed, deleted, n = _sync_org(con, name, url, batch_size, None)
+            changed, deleted, n = _sync_org(
+                con, name, url, batch_size, None, max_pending_deletes
+            )
             print(
                 f"[bold]{name}[/bold]: {n} resources processed, "
                 f"{changed} changed, {deleted} deleted"
@@ -319,12 +373,43 @@ def sync_all(
         con.close()
 
 
+def _maybe_apply_deletes(
+    con: duckdb.DuckDBPyConnection, org: str, pos: str, max_pending: int
+) -> None:
+    """
+    Apply the accumulated delete backlog if it has grown past `max_pending`.
+
+    A long delta chain makes its own deletes progressively more expensive: each
+    one adds tombstones, and every later DELETE loads the delete history of the
+    files it opens (off-pool, not bounded by memory_limit). Left alone a big
+    initial load or catch-up eventually OOMs partway through, so keep the backlog
+    under control as we go rather than only at the end.
+    """
+    if not max_pending:
+        return
+    _, pending_rows = lake.pending_deletes(con)
+    if pending_rows <= max_pending:
+        return
+    typer.echo(
+        f"  {pos} {org}: {pending_rows:,} tombstoned rows pending "
+        f"(> {max_pending:,}), applying them…",
+        err=True,
+    )
+    s = lake.compact(con, days=0, rewrite_deletes=0.1)
+    typer.echo(
+        f"  {pos} {org}: backlog {s['deleted_rows_before']:,} → "
+        f"{s['deleted_rows_after']:,} rows ({s['rewritten']} file(s) rewritten)",
+        err=True,
+    )
+
+
 def _sync_org(
     con: duckdb.DuckDBPyConnection,
     org: str,
     resourcelist_url: str,
     batch_size: int,
     limit: int | None,
+    max_pending_deletes: int = DEFAULT_MAX_PENDING_DELETES,
 ) -> tuple[int, int, int]:
     cursor = lake.get_cursor(con, org)
     resources = resourcesync.get_resources(resourcelist_url)
@@ -393,6 +478,7 @@ def _sync_org(
                     con, org, resource.kind, (records_pq, meta_pq), resource.lastmod
                 )
                 total_changed += changed
+        _maybe_apply_deletes(con, org, pos, max_pending_deletes)
     return total_changed, total_deleted, total
 
 

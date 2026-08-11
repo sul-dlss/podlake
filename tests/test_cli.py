@@ -175,6 +175,66 @@ def test_compact_dry_run_command(tmp_path, monkeypatch):
     assert "dry run" in result.output
 
 
+def test_compact_applies_deletes_by_default(tmp_path, monkeypatch):
+    """The delete-rewrite is on by default: leaving it opt-in is how a backlog
+    silently accumulates until DELETEs stop fitting in memory."""
+    monkeypatch.setenv("PODLAKE_PROFILE", "file")
+    monkeypatch.setenv("PODLAKE_CATALOG", str(tmp_path / "podlake.ducklake"))
+    monkeypatch.setenv("PODLAKE_DATA_PATH", str(tmp_path / "data") + "/")
+
+    config = get_config()
+    con = lake.connect(read_only=False, config=config)
+    lake.ensure_schema(con)
+    con.execute(
+        "INSERT INTO records SELECT 'x', 'x:' || i, '245', 1, '1', '0', 'a', 0, "
+        "'t' || i FROM range(50000) s(i)"
+    )
+    con.execute(
+        "DELETE FROM records WHERE org = 'x' "
+        "AND (CAST(substr(pod_record_id, 3) AS INTEGER) % 5) = 0"
+    )
+    assert lake.pending_deletes(con)[1] > 0
+    con.close()
+
+    # --no-rewrite-deletes leaves the backlog in place
+    result = runner.invoke(app, ["compact", "--no-rewrite-deletes"])
+    assert result.exit_code == 0, result.output
+    con = lake.connect(read_only=True, config=config)
+    assert lake.pending_deletes(con)[1] > 0
+    con.close()
+
+    # the default run applies it
+    result = runner.invoke(app, ["compact"])
+    assert result.exit_code == 0, result.output
+    assert "pending deletes" in result.output
+    con = lake.connect(read_only=True, config=config)
+    assert lake.pending_deletes(con) == (0, 0)
+    assert con.execute("SELECT count(*) FROM records").fetchone() == (40000,)
+    con.close()
+
+
+def test_sync_applies_deletes_when_backlog_exceeds_threshold(tmp_path, monkeypatch):
+    _patch(monkeypatch)
+    monkeypatch.setenv("PODLAKE_PROFILE", "file")
+    monkeypatch.setenv("PODLAKE_CATALOG", str(tmp_path / "podlake.ducklake"))
+    monkeypatch.setenv("PODLAKE_DATA_PATH", str(tmp_path / "data") + "/")
+
+    # a threshold of 1 row makes every resource trip the mid-sync check; the sync
+    # must still finish and leave the lake correct
+    result = runner.invoke(app, ["sync", "brown", "--max-pending-deletes", "1"])
+    assert result.exit_code == 0, result.output
+
+    con = lake.connect(read_only=True, config=get_config())
+    ids = [
+        r[0]
+        for r in con.execute(
+            "SELECT pod_record_id FROM record_meta ORDER BY pod_record_id"
+        ).fetchall()
+    ]
+    assert ids == ["brown:a1"]
+    con.close()
+
+
 def test_sync_loads_into_lake(tmp_path, monkeypatch):
     _patch(monkeypatch)
     monkeypatch.setenv("PODLAKE_PROFILE", "file")
