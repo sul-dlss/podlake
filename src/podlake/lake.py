@@ -359,25 +359,22 @@ def _snapshot_count(con: duckdb.DuckDBPyConnection) -> int:
 
 def pending_deletes(con: duckdb.DuckDBPyConnection) -> tuple[int, int]:
     """
-    Return (delete_files, deleted_rows) still live in the lake — rows that are
-    tombstoned but not yet physically removed from their data files.
+    Return (delete_files, deleted_rows) still tombstoned but not yet physically
+    removed from their data files. See the README's "delete backlog" section for
+    why this number governs how much memory a DELETE needs.
 
-    This is the number that makes deletes expensive: on every DELETE, DuckLake
-    loads the full delete history of each data file it opens and holds it for the
-    duration of the statement, so a large backlog here can exhaust memory
-    regardless of how few rows the DELETE actually removes. `rewrite_deletes`
-    drives it back down.
+    Errors are deliberately *not* swallowed: reporting an empty backlog when we
+    simply failed to read it would silently disable the mid-sync safeguard that
+    depends on this. An unbuilt lake is the one legitimate zero.
     """
-    # DuckLake's bookkeeping tables live in a side catalog, not in the lake itself
-    try:
-        row = con.execute(
-            "SELECT count(*), coalesce(sum(delete_count), 0) "
-            f"FROM __ducklake_metadata_{LAKE_ALIAS}.ducklake_delete_file "
-            "WHERE end_snapshot IS NULL"
-        ).fetchone()
-    except duckdb.Error:
-        # a lake that has never been written has no metadata tables yet
+    if not _table_exists(con, RECORDS_TABLE):
         return (0, 0)
+    # DuckLake's bookkeeping lives in a side catalog, not in the lake itself
+    row = con.execute(
+        "SELECT count(*), coalesce(sum(delete_count), 0) "
+        f"FROM __ducklake_metadata_{LAKE_ALIAS}.ducklake_delete_file "
+        "WHERE end_snapshot IS NULL"
+    ).fetchone()
     return (int(row[0]), int(row[1])) if row else (0, 0)
 
 
@@ -416,23 +413,17 @@ def compact(
     dry = "true" if dry_run else "false"
     older_than = f"now() - INTERVAL '{int(days)} days'"
 
-    def run(fn: str) -> int:
+    def run(fn: str, measure: str = "count(*)") -> int:
         # Materialize via CTAS so the side-effecting table function runs fully: a
         # bare count() can be optimized away, and fetching the functions'
         # TIMESTAMPTZ columns into Python would require pytz. The temp table keeps
         # the timestamps inside DuckDB.
         con.execute(f"CREATE OR REPLACE TEMP TABLE _compact AS SELECT * FROM {fn}")
-        row = con.execute("SELECT count(*) FROM _compact").fetchone()
-        return row[0] if row else 0
-
-    def run_rewrite(fn: str) -> int:
-        # The rewrite returns one row per table/compaction group, not per file, so
-        # count the files it actually processed rather than the result rows.
-        con.execute(f"CREATE OR REPLACE TEMP TABLE _compact AS SELECT * FROM {fn}")
-        row = con.execute(
-            "SELECT coalesce(sum(files_processed), 0) FROM _compact"
-        ).fetchone()
+        row = con.execute(f"SELECT {measure} FROM _compact").fetchone()
         return int(row[0]) if row else 0
+
+    # the rewrite returns a row per table/compaction group, not per file
+    FILES = "coalesce(sum(files_processed), 0)"
 
     before = _snapshot_count(con)
     delete_files_before, deleted_rows_before = pending_deletes(con)
@@ -455,7 +446,7 @@ def compact(
                 if max_files is not None
                 else ")"
             )
-            rewritten = run_rewrite(bounded)
+            rewritten = run(bounded, FILES)
         except duckdb.Error as e:
             # max_compacted_files was added to ducklake_rewrite_data_files after
             # some released versions; without it the rewrite can't be bounded, so
@@ -466,7 +457,7 @@ def compact(
                 "this DuckLake version does not support max_compacted_files — "
                 "rewriting the whole backlog in one pass (this may take a long time)"
             )
-            rewritten = run_rewrite(fn + ")")
+            rewritten = run(fn + ")", FILES)
 
     totals = {"expired": 0, "merged": 0, "cleaned": 0, "orphaned": 0, "passes": 0}
     while totals["passes"] < max_passes:

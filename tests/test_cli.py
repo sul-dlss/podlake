@@ -269,3 +269,33 @@ def test_sync_verbose_logs_apply_steps(tmp_path, monkeypatch):
     assert "brown full: delete records" in result.output
     assert "brown full: insert records" in result.output
     assert "brown full: commit" in result.output
+
+
+def test_sync_log_file_quiets_console(tmp_path, monkeypatch):
+    """--log sends progress to a file and leaves stdout/stderr quiet, so a cron
+    run only mails on failure."""
+    _patch(monkeypatch)
+    monkeypatch.setenv("PODLAKE_PROFILE", "file")
+    monkeypatch.setenv("PODLAKE_CATALOG", str(tmp_path / "podlake.ducklake"))
+    monkeypatch.setenv("PODLAKE_DATA_PATH", str(tmp_path / "data") + "/")
+    log = tmp_path / "sync.log"
+
+    result = runner.invoke(app, ["sync", "brown", "--log", str(log)])
+    assert result.exit_code == 0, result.output
+    assert result.output.strip() == ""
+
+    written = log.read_text()
+    assert "downloading" in written
+    assert "resources processed" in written
+
+
+def test_delete_limit_never_below_known_floor():
+    """Demanding a backlog the rewrite has already failed to reach just burns
+    compaction cycles, so the floor wins over the big-resource limit."""
+    from podlake.cli import BIG_RESOURCE_BYTES, _delete_limit_for
+
+    small, big = 1, BIG_RESOURCE_BYTES
+    assert _delete_limit_for(small, 100_000_000, 0) == 100_000_000
+    assert _delete_limit_for(big, 100_000_000, 0) == 50_000_000
+    # a proven floor above the strict limit raises it rather than chasing 50M
+    assert _delete_limit_for(big, 100_000_000, 76_000_000) == 76_000_000

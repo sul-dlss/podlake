@@ -223,6 +223,16 @@ $ systemd-run --user --scope -p MemoryMax=24G -p MemorySwapMax=0 \
     uvx podlake sync-all
 ```
 
+For unattended runs, `--log` writes progress to a file, turns off the progress
+bars, and leaves the console quiet — so cron only mails you when something
+actually fails. `--verbose` instead logs each apply step (delete/insert/commit)
+with timings to the terminal, which is how you pin a stall to a statement:
+
+```
+$ uvx podlake sync-all --log /var/log/podlake.log
+$ uvx podlake sync harvard --verbose
+```
+
 **Publish** shares a local lake read-only by syncing its Parquet and catalog to
 S3; consumers then attach over `s3://` with no database to reach. It's
 incremental (skips files already uploaded), and additive — it never deletes from
