@@ -14,12 +14,20 @@ from podlake.convert import dump_to_parquet
 
 app = typer.Typer()
 
-# Tombstoned rows a DELETE has to load before it gets uncomfortable. Every DELETE
-# loads the full delete history of each data file it opens, off-pool and not
-# bounded by memory_limit, so this — not the number of rows being deleted — is
-# what decides whether a delta fits in RAM. Measured on a 32GB box: ~105M was
-# fine, ~558M peaked at 95%. The safe ceiling scales with RAM, hence the flag.
-DEFAULT_MAX_PENDING_DELETES = 300_000_000
+# Tombstoned rows a DELETE has to load before it gets dangerous. Every DELETE
+# loads the delete history of each data file it opens, off-pool and not bounded
+# by memory_limit, so the backlog — more than the number of rows being deleted —
+# decides whether a delta fits in RAM. Measured on a 32GB box: a 389k-record
+# delta was fine at 105M pending, but a 1.1M-record one was OOM-killed at 153M.
+# Cost per pending row is steep and the safe level depends on delta size too, so
+# this is deliberately conservative; raise it on a machine with more RAM.
+DEFAULT_MAX_PENDING_DELETES = 75_000_000
+
+# Rewrite threshold the mid-sync cleanup starts at, halving down to the minimum
+# while the backlog stays over the limit. 0.1 was too timid: on a lake that had
+# been kept at 0.1 the floor was ~157M, above the level that OOMed.
+MID_SYNC_DELETE_THRESHOLD = 0.05
+MIN_DELETE_THRESHOLD = 0.01
 
 # Backlog beyond which an unbounded rewrite is worth warning about up front.
 _BIG_DELETE_BACKLOG = 500_000_000
@@ -389,11 +397,12 @@ def _maybe_apply_deletes(
     initial load or catch-up eventually OOMs partway through, so keep the backlog
     under control as we go rather than only at the end.
 
-    Not all of a backlog is reclaimable: the rewrite only touches files past the
-    delete threshold, so there is a floor below which it can do nothing. Without
-    hysteresis a limit set near that floor re-triggers on every single resource
-    and pays a full compaction cycle each time for no gain, so raise our own
-    trigger above whatever the rewrite actually left behind.
+    Each rewrite threshold has a floor — it only touches files past that fraction
+    deleted — and that floor can sit above the level a large delta needs. When a
+    rewrite comes up short we therefore get *more aggressive* (halve the
+    threshold) rather than tolerating a bigger backlog: raising the trigger would
+    just defer the OOM to a later, larger resource. Only once the threshold
+    bottoms out is the backlog genuinely irreducible, and then we say so.
     """
     limit = state.get("limit", max_pending)
     if not limit:
@@ -401,38 +410,41 @@ def _maybe_apply_deletes(
     _, pending_rows = lake.pending_deletes(con)
     if pending_rows <= limit:
         return
+
+    threshold = state.get("threshold", MID_SYNC_DELETE_THRESHOLD)
     typer.echo(
         f"  {pos} {org}: {pending_rows:,} tombstoned rows pending "
-        f"(> {limit:,}), applying them…",
+        f"(> {limit:,}), applying them (threshold {threshold})…",
         err=True,
     )
-    s = lake.compact(con, days=0, rewrite_deletes=0.1)
+    s = lake.compact(con, days=0, rewrite_deletes=threshold)
     after = s["deleted_rows_after"]
     typer.echo(
         f"  {pos} {org}: backlog {s['deleted_rows_before']:,} → {after:,} rows "
         f"({s['rewritten']} file(s) rewritten)",
         err=True,
     )
-    # Back off if we're near the floor, so the next check has room to be useful —
-    # but never past `ceiling`, or a rewrite that can't keep up would quietly
-    # ratchet the trigger into the range where deltas stop fitting in memory.
-    if after > limit * 0.75:
-        ceiling = max_pending * 2
-        state["limit"] = min(int(after * 1.5), ceiling)
+    if after <= limit:
+        return
+
+    # Still over the line: rewrite harder next time rather than accepting it.
+    if threshold > MIN_DELETE_THRESHOLD:
+        state["threshold"] = max(MIN_DELETE_THRESHOLD, threshold / 2)
         typer.echo(
-            f"  {pos} {org}: little left to reclaim at this threshold — "
-            f"raising the trigger to {state['limit']:,} rows",
+            f"  {pos} {org}: still over the limit — lowering the rewrite threshold "
+            f"to {state['threshold']} for the next pass",
             err=True,
         )
-        if state["limit"] >= ceiling:
-            typer.echo(
-                f"  {pos} {org}: [warning] backlog is not being reclaimed and the "
-                f"trigger has hit its ceiling ({ceiling:,}). Deltas will get slower "
-                "and may run out of memory. Interrupt and run "
-                "`podlake compact --delete-threshold 0.05` (or lower) to clear it — "
-                "the sync resumes from where it stopped.",
-                err=True,
-            )
+        return
+
+    # Threshold is as low as it goes and the backlog still won't come down.
+    state["limit"] = int(after * 1.5)
+    typer.echo(
+        f"  {pos} {org}: [warning] {after:,} tombstoned rows could not be reclaimed "
+        f"even at threshold {threshold}. Later deltas may run out of memory; if one "
+        "does, the sync resumes from where it stopped.",
+        err=True,
+    )
 
 
 def _sync_org(
