@@ -19,7 +19,7 @@ app = typer.Typer()
 # bounded by memory_limit, so this — not the number of rows being deleted — is
 # what decides whether a delta fits in RAM. Measured on a 32GB box: ~105M was
 # fine, ~558M peaked at 95%. The safe ceiling scales with RAM, hence the flag.
-DEFAULT_MAX_PENDING_DELETES = 150_000_000
+DEFAULT_MAX_PENDING_DELETES = 300_000_000
 
 # Backlog beyond which an unbounded rewrite is worth warning about up front.
 _BIG_DELETE_BACKLOG = 500_000_000
@@ -374,7 +374,11 @@ def sync_all(
 
 
 def _maybe_apply_deletes(
-    con: duckdb.DuckDBPyConnection, org: str, pos: str, max_pending: int
+    con: duckdb.DuckDBPyConnection,
+    org: str,
+    pos: str,
+    max_pending: int,
+    state: dict,
 ) -> None:
     """
     Apply the accumulated delete backlog if it has grown past `max_pending`.
@@ -384,23 +388,39 @@ def _maybe_apply_deletes(
     files it opens (off-pool, not bounded by memory_limit). Left alone a big
     initial load or catch-up eventually OOMs partway through, so keep the backlog
     under control as we go rather than only at the end.
+
+    Not all of a backlog is reclaimable: the rewrite only touches files past the
+    delete threshold, so there is a floor below which it can do nothing. Without
+    hysteresis a limit set near that floor re-triggers on every single resource
+    and pays a full compaction cycle each time for no gain, so raise our own
+    trigger above whatever the rewrite actually left behind.
     """
-    if not max_pending:
+    limit = state.get("limit", max_pending)
+    if not limit:
         return
     _, pending_rows = lake.pending_deletes(con)
-    if pending_rows <= max_pending:
+    if pending_rows <= limit:
         return
     typer.echo(
         f"  {pos} {org}: {pending_rows:,} tombstoned rows pending "
-        f"(> {max_pending:,}), applying them…",
+        f"(> {limit:,}), applying them…",
         err=True,
     )
     s = lake.compact(con, days=0, rewrite_deletes=0.1)
+    after = s["deleted_rows_after"]
     typer.echo(
-        f"  {pos} {org}: backlog {s['deleted_rows_before']:,} → "
-        f"{s['deleted_rows_after']:,} rows ({s['rewritten']} file(s) rewritten)",
+        f"  {pos} {org}: backlog {s['deleted_rows_before']:,} → {after:,} rows "
+        f"({s['rewritten']} file(s) rewritten)",
         err=True,
     )
+    # Back off if we're near the floor, so the next check has room to be useful.
+    if after > limit * 0.75:
+        state["limit"] = int(after * 1.5)
+        typer.echo(
+            f"  {pos} {org}: little left to reclaim at this threshold — "
+            f"raising the trigger to {state['limit']:,} rows",
+            err=True,
+        )
 
 
 def _sync_org(
@@ -424,6 +444,7 @@ def _sync_org(
         )
 
     total_changed = total_deleted = 0
+    delete_state: dict = {}
     for i, resource in enumerate(pending, 1):
         pos = f"[{i}/{total}]"
         with tempfile.TemporaryDirectory() as tmp:
@@ -478,7 +499,7 @@ def _sync_org(
                     con, org, resource.kind, (records_pq, meta_pq), resource.lastmod
                 )
                 total_changed += changed
-        _maybe_apply_deletes(con, org, pos, max_pending_deletes)
+        _maybe_apply_deletes(con, org, pos, max_pending_deletes, delete_state)
     return total_changed, total_deleted, total
 
 
