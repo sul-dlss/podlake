@@ -56,7 +56,7 @@ def _resources():
     ]
 
 
-def _fake_download(url, path, fixity=None, desc=None):
+def _fake_download(url, path, fixity=None, desc=None, quiet=False):
     if url.endswith(".del.txt"):
         path.write_text("a2\n")  # delete record a2
     else:
@@ -332,3 +332,66 @@ def test_compact_supports_log(tmp_path, monkeypatch):
     assert result.exit_code == 0, result.output
     assert result.output.strip() == ""
     assert "pending deletes" in log.read_text()
+
+
+def _con():
+    """A throwaway connection; the lake calls under test are all monkeypatched."""
+    return duckdb.connect()
+
+
+def _fake_backlog(monkeypatch, pending, after):
+    """Drive _maybe_apply_deletes with a scripted backlog. Returns the list of
+    thresholds the rewrite was actually asked for."""
+    from podlake import cli
+
+    tried = []
+    monkeypatch.setattr(cli.lake, "pending_deletes", lambda con: (1, pending))
+
+    def fake_compact(con, *, days, rewrite_deletes):
+        tried.append(rewrite_deletes)
+        return {
+            "deleted_rows_before": pending,
+            "deleted_rows_after": after(rewrite_deletes),
+            "rewritten": 1,
+        }
+
+    monkeypatch.setattr(cli.lake, "compact", fake_compact)
+    return tried
+
+
+def test_backlog_escalates_then_records_floor(monkeypatch):
+    """When no threshold can get under the limit, halve down to the minimum and
+    remember the floor — rather than give up early or retry forever."""
+    from podlake import cli
+
+    tried = _fake_backlog(monkeypatch, 200_000_000, lambda t: 200_000_000)
+    state: dict = {}
+    cli._maybe_apply_deletes(_con(), "x", "[1/1]", 1, 100_000_000, state)
+
+    assert tried == [0.05, 0.025, 0.0125, 0.01]  # stops at the minimum
+    assert state["floor"] == 200_000_000
+
+    # a later resource at or below the floor must not pay for the ladder again
+    tried.clear()
+    cli._maybe_apply_deletes(_con(), "x", "[2/2]", 1, 100_000_000, state)
+    assert tried == []
+
+
+def test_backlog_stops_as_soon_as_it_is_under_the_limit(monkeypatch):
+    """The cheap threshold suffices, so don't escalate or record a floor."""
+    from podlake import cli
+
+    tried = _fake_backlog(monkeypatch, 200_000_000, lambda t: 50_000_000)
+    state: dict = {}
+    cli._maybe_apply_deletes(_con(), "x", "[1/1]", 1, 100_000_000, state)
+
+    assert tried == [0.05]
+    assert "floor" not in state
+
+
+def test_backlog_check_disabled_by_zero(monkeypatch):
+    from podlake import cli
+
+    tried = _fake_backlog(monkeypatch, 900_000_000, lambda t: 900_000_000)
+    cli._maybe_apply_deletes(_con(), "x", "[1/1]", 1, 0, {})
+    assert tried == []

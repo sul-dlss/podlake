@@ -1,4 +1,5 @@
 import logging
+import sys
 import tempfile
 from pathlib import Path
 from typing import Annotated
@@ -75,6 +76,12 @@ def _connect_writable(config: Config | None = None) -> duckdb.DuckDBPyConnection
     return con
 
 
+def _download_bar_hidden() -> bool:
+    """Whether the download's own progress bar will be invisible — because we're
+    logging to a file, or stderr isn't a terminal (cron, or piped through tee)."""
+    return _LOGGING_TO_FILE or not sys.stderr.isatty()
+
+
 def _progress(msg: str) -> None:
     """A progress line: into the log file with --log, otherwise onto stderr."""
     if _LOGGING_TO_FILE:
@@ -98,6 +105,22 @@ def _summary(plain: str, rich_markup: str) -> None:
 DEFAULT_MAX_PENDING_DELETES = 100_000_000
 MID_SYNC_DELETE_THRESHOLD = 0.05
 MIN_DELETE_THRESHOLD = 0.01
+
+
+def _threshold_ladder() -> list[float]:
+    """Rewrite thresholds to try in one pass, cheapest first, halving down to the
+    minimum. A fixed list rather than a loop condition: the escalation is then
+    bounded by construction, and cannot spin if a comparison is ever wrong."""
+    ladder = []
+    t = MID_SYNC_DELETE_THRESHOLD
+    while t > MIN_DELETE_THRESHOLD and len(ladder) < 8:
+        ladder.append(t)
+        t /= 2
+    ladder.append(MIN_DELETE_THRESHOLD)
+    return ladder
+
+
+THRESHOLD_LADDER = _threshold_ladder()
 
 # Resources at least this large are held to a stricter backlog limit.
 BIG_RESOURCE_BYTES = 100 * 1024 * 1024
@@ -501,8 +524,7 @@ def _maybe_apply_deletes(
             "long time and cannot be interrupted for partial credit"
         )
 
-    threshold = MID_SYNC_DELETE_THRESHOLD
-    while True:
+    for threshold in THRESHOLD_LADDER:
         _progress(
             f"  {pos} {org}: {pending:,} tombstoned rows pending (> {limit:,}), "
             f"applying them (threshold {threshold})…"
@@ -515,14 +537,12 @@ def _maybe_apply_deletes(
         )
         if pending <= limit:
             return
-        if threshold <= MIN_DELETE_THRESHOLD:
-            break
-        threshold = max(MIN_DELETE_THRESHOLD, threshold / 2)
 
     state["floor"] = pending
     _progress(
         f"  {pos} {org}: {pending:,} tombstoned rows could not be reclaimed even at "
-        f"threshold {threshold}; continuing, and not retrying below this level"
+        f"threshold {MIN_DELETE_THRESHOLD}; continuing, and not retrying below this "
+        "level"
     )
 
 
@@ -555,10 +575,11 @@ def _sync_org(
             con, org, pos, resource.length, max_pending_deletes, delete_state
         )
         with tempfile.TemporaryDirectory() as tmp:
-            _progress(
-                f"  {pos} {org} {resource.kind}: downloading "
-                f"{humanize.naturalsize(resource.length)}…"
-            )
+            if _download_bar_hidden():
+                _progress(
+                    f"  {pos} {org} {resource.kind}: downloading "
+                    f"{humanize.naturalsize(resource.length)}…"
+                )
             if resource.kind == "deletes":
                 del_path = Path(tmp) / "deletes.txt"
                 resourcesync.download(
@@ -566,6 +587,7 @@ def _sync_org(
                     del_path,
                     fixity=resource.fixity,
                     desc=f"{pos} {org} {resource.kind}: downloading",
+                    quiet=_LOGGING_TO_FILE,
                 )
                 ids = [f"{org}:{rid}" for rid in resourcesync.read_delete_ids(del_path)]
                 _progress(
@@ -583,6 +605,7 @@ def _sync_org(
                     dl_path,
                     fixity=resource.fixity,
                     desc=f"{pos} {org} {resource.kind}: downloading",
+                    quiet=_LOGGING_TO_FILE,
                 )
                 records_pq = Path(tmp) / "records.parquet"
                 meta_pq = Path(tmp) / "meta.parquet"
