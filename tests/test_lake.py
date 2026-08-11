@@ -375,5 +375,43 @@ def test_compact_dry_run_changes_nothing(tmp_path):
         stats = lake.compact(con, days=0, dry_run=True)
         assert stats["snapshots_after"] == stats["snapshots_before"]
         assert stats["merged"] == 0
+        assert stats["passes"] == 1  # dry run never loops
+    finally:
+        con.close()
+
+
+def test_rewrite_deletes_clears_tombstoned_rows(tmp_path):
+    con = lake.connect(read_only=False, config=_dev_config(tmp_path))
+    try:
+        lake.ensure_schema(con)
+        # enough rows to write a real data file rather than inlining into the catalog
+        con.execute(
+            "INSERT INTO records SELECT 'x', 'x:' || i, '245', 1, '1', '0', 'a', 0, "
+            "'t' || i FROM range(50000) s(i)"
+        )
+        # delete ~20% of the rows: a plain compact leaves these tombstoned, because
+        # merge_adjacent_files skips files that are already at the target size
+        con.execute(
+            "DELETE FROM records WHERE org = 'x' "
+            "AND (CAST(substr(pod_record_id, 3) AS INTEGER) % 5) = 0"
+        )
+
+        files, rows = lake.pending_deletes(con)
+        assert files >= 1 and rows > 0
+
+        lake.compact(con, days=0)
+        _, still_pending = lake.pending_deletes(con)
+        assert still_pending == rows  # plain compact does not apply them
+
+        stats = lake.compact(con, days=0, rewrite_deletes=0.05)
+        assert stats["rewritten"] >= 1
+        assert stats["deleted_rows_before"] == rows
+        assert stats["deleted_rows_after"] == 0  # tombstones physically applied
+        assert lake.pending_deletes(con) == (0, 0)
+
+        # and the surviving data is intact and correct
+        assert con.execute(
+            "SELECT count(*) FROM records WHERE org = 'x'"
+        ).fetchone() == (40000,)
     finally:
         con.close()

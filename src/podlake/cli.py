@@ -187,17 +187,47 @@ def compact(
             help="Report what would be reclaimed without changing anything.",
         ),
     ] = False,
+    rewrite_deletes: Annotated[
+        float | None,
+        typer.Option(
+            "--rewrite-deletes",
+            help="Also rewrite data files to physically apply accumulated deletes, "
+            "for files at least this fraction deleted (e.g. 0.05 = 5%). This is the "
+            "only step that clears tombstoned rows from large files, and it keeps "
+            "later DELETEs cheap — but it rewrites real data, so it is slow. Bound "
+            "one run with --max-files and re-run to make progress incrementally.",
+            min=0.0,
+            max=1.0,
+        ),
+    ] = None,
+    max_files: Annotated[
+        int | None,
+        typer.Option(
+            "--max-files",
+            help="Cap how many files --rewrite-deletes rewrites in one run, so a "
+            "huge backlog can be worked through a chunk at a time.",
+        ),
+    ] = None,
 ):
     """
     Reclaim disk space. DuckLake is merge-on-read, so superseded rows from
     deltas/deletes and re-imported full dumps accumulate on disk until this runs:
     it expires old snapshots, compacts small Parquet files, and deletes the data
     files no longer referenced by a live snapshot.
+
+    Note that compacting small files does NOT clear tombstoned rows out of large
+    data files — pass --rewrite-deletes for that.
     """
     config = get_config()
     con = lake.connect(read_only=False, config=config)
     try:
-        s = lake.compact(con, days=older_than_days, dry_run=dry_run)
+        s = lake.compact(
+            con,
+            days=older_than_days,
+            dry_run=dry_run,
+            rewrite_deletes=rewrite_deletes,
+            max_files=max_files,
+        )
     finally:
         con.close()
 
@@ -209,10 +239,17 @@ def compact(
         )
     else:
         print(
-            f"snapshots {s['snapshots_before']} → {s['snapshots_after']}; "
+            f"snapshots {s['snapshots_before']} → {s['snapshots_after']} "
+            f"in {s['passes']} pass(es); "
             f"expired {s['expired']}, merged {s['merged']}, "
             f"deleted {s['cleaned']} old + {s['orphaned']} orphaned data files"
         )
+    print(
+        f"pending deletes: {s['delete_files_before']:,} files / "
+        f"{s['deleted_rows_before']:,} rows → "
+        f"{s['delete_files_after']:,} files / {s['deleted_rows_after']:,} rows"
+        + (f" ({s['rewritten']} file(s) rewritten)" if s["rewritten"] else "")
+    )
 
 
 @app.command()

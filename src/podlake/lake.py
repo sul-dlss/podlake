@@ -320,8 +320,38 @@ def _snapshot_count(con: duckdb.DuckDBPyConnection) -> int:
     return row[0] if row else 0
 
 
+def pending_deletes(con: duckdb.DuckDBPyConnection) -> tuple[int, int]:
+    """
+    Return (delete_files, deleted_rows) still live in the lake — rows that are
+    tombstoned but not yet physically removed from their data files.
+
+    This is the number that makes deletes expensive: on every DELETE, DuckLake
+    loads the full delete history of each data file it opens and holds it for the
+    duration of the statement, so a large backlog here can exhaust memory
+    regardless of how few rows the DELETE actually removes. `rewrite_deletes`
+    drives it back down.
+    """
+    # DuckLake's bookkeeping tables live in a side catalog, not in the lake itself
+    try:
+        row = con.execute(
+            "SELECT count(*), coalesce(sum(delete_count), 0) "
+            f"FROM __ducklake_metadata_{LAKE_ALIAS}.ducklake_delete_file "
+            "WHERE end_snapshot IS NULL"
+        ).fetchone()
+    except duckdb.Error:
+        # a lake that has never been written has no metadata tables yet
+        return (0, 0)
+    return (int(row[0]), int(row[1])) if row else (0, 0)
+
+
 def compact(
-    con: duckdb.DuckDBPyConnection, *, days: int = 0, dry_run: bool = False
+    con: duckdb.DuckDBPyConnection,
+    *,
+    days: int = 0,
+    dry_run: bool = False,
+    rewrite_deletes: float | None = None,
+    max_files: int | None = None,
+    max_passes: int = 10,
 ) -> dict[str, int]:
     """
     Reclaim disk in the attached lake. DuckLake is merge-on-read, so superseded
@@ -329,7 +359,22 @@ def compact(
     this runs. It expires snapshots older than `days` days (0 = all but the
     current), compacts small Parquet files, then deletes the data files no longer
     referenced by a live snapshot. With dry_run=True nothing changes and the
-    counts report what *would* be reclaimed. Returns a stats dict.
+    counts report what *would* be reclaimed.
+
+    `rewrite_deletes` additionally rewrites data files to physically apply their
+    accumulated deletes, for files where the deleted fraction is at least that
+    value (0.05 = 5%). This is the only step that clears tombstoned rows out of
+    *large* data files: `merge_adjacent_files` skips any file already at the
+    target size, and DuckLake's own `rewrite_data_files` defaults to a 0.95
+    threshold, so without this a big file's deletes accumulate forever. It
+    rewrites real data, so it is much more expensive than the other steps — use
+    `max_files` to bound one run and re-run to make progress incrementally.
+
+    A single expire → merge → cleanup pass never fully compacts: merging creates
+    new snapshots and freshly-superseded files that only become collectable once
+    a *later* expire pass removes the snapshots referencing them. So the cleanup
+    cycle repeats until a pass reclaims nothing (or `max_passes`). Returns a
+    stats dict, including the number of cleanup `passes` run.
     """
     dry = "true" if dry_run else "false"
     older_than = f"now() - INTERVAL '{int(days)} days'"
@@ -344,29 +389,63 @@ def compact(
         return row[0] if row else 0
 
     before = _snapshot_count(con)
-    expired = run(
-        f"ducklake_expire_snapshots('{LAKE_ALIAS}', "
-        f"dry_run => {dry}, older_than => {older_than})"
-    )
-    # merge has no dry-run mode, so only compact for real runs
-    merged = 0 if dry_run else run(f"ducklake_merge_adjacent_files('{LAKE_ALIAS}')")
-    cleaned = run(
-        f"ducklake_cleanup_old_files('{LAKE_ALIAS}', "
-        f"dry_run => {dry}, cleanup_all => true)"
-    )
-    orphaned = run(
-        f"ducklake_delete_orphaned_files('{LAKE_ALIAS}', "
-        f"dry_run => {dry}, cleanup_all => true)"
-    )
+    delete_files_before, deleted_rows_before = pending_deletes(con)
+
+    # Apply accumulated deletes first, so the cleanup cycle below can collect the
+    # data + delete files the rewrite supersedes. No dry-run mode upstream.
+    rewritten = 0
+    if rewrite_deletes is not None and not dry_run:
+        args = [f"delete_threshold => {float(rewrite_deletes)}"]
+        if max_files is not None:
+            args.append(f"max_compacted_files => {int(max_files)}")
+        logger.info(
+            "rewriting data files with >=%.0f%% deletes (%s delete files, %s rows)",
+            float(rewrite_deletes) * 100,
+            f"{delete_files_before:,}",
+            f"{deleted_rows_before:,}",
+        )
+        rewritten = run(
+            f"ducklake_rewrite_data_files('{LAKE_ALIAS}', {', '.join(args)})"
+        )
+
+    totals = {"expired": 0, "merged": 0, "cleaned": 0, "orphaned": 0, "passes": 0}
+    while totals["passes"] < max_passes:
+        expired = run(
+            f"ducklake_expire_snapshots('{LAKE_ALIAS}', "
+            f"dry_run => {dry}, older_than => {older_than})"
+        )
+        # merge has no dry-run mode, so only compact for real runs
+        merged = 0 if dry_run else run(f"ducklake_merge_adjacent_files('{LAKE_ALIAS}')")
+        cleaned = run(
+            f"ducklake_cleanup_old_files('{LAKE_ALIAS}', "
+            f"dry_run => {dry}, cleanup_all => true)"
+        )
+        orphaned = run(
+            f"ducklake_delete_orphaned_files('{LAKE_ALIAS}', "
+            f"dry_run => {dry}, cleanup_all => true)"
+        )
+        totals["expired"] += expired
+        totals["merged"] += merged
+        totals["cleaned"] += cleaned
+        totals["orphaned"] += orphaned
+        totals["passes"] += 1
+        # dry runs never mutate (so looping is pointless); real runs stop once a
+        # pass leaves everything in place — the fixed point.
+        if dry_run or expired + merged + cleaned + orphaned == 0:
+            break
+
     con.execute("DROP TABLE IF EXISTS _compact")
+    delete_files_after, deleted_rows_after = pending_deletes(con)
 
     stats = {
+        **totals,
         "snapshots_before": before,
         "snapshots_after": _snapshot_count(con),
-        "expired": expired,
-        "merged": merged,
-        "cleaned": cleaned,
-        "orphaned": orphaned,
+        "rewritten": rewritten,
+        "delete_files_before": delete_files_before,
+        "delete_files_after": delete_files_after,
+        "deleted_rows_before": deleted_rows_before,
+        "deleted_rows_after": deleted_rows_after,
     }
     logger.info("compact: %s", stats)
     return stats
