@@ -20,8 +20,11 @@ app = typer.Typer()
 # decides whether a delta fits in RAM. Measured on a 32GB box: a 389k-record
 # delta was fine at 105M pending, but a 1.1M-record one was OOM-killed at 153M.
 # Cost per pending row is steep and the safe level depends on delta size too, so
-# this is deliberately conservative; raise it on a machine with more RAM.
-DEFAULT_MAX_PENDING_DELETES = 75_000_000
+# the usable window is narrow: on that lake a 0.05 rewrite bottomed out near 76M,
+# leaving roughly 76M-153M to aim at. Set below the floor and the trigger fires
+# every resource achieving nothing; set above the danger line and a large delta
+# dies. Adjust for your own lake (see `podlake compact` output) and RAM.
+DEFAULT_MAX_PENDING_DELETES = 100_000_000
 
 # Rewrite threshold the mid-sync cleanup starts at, halving down to the minimum
 # while the backlog stays over the limit. 0.1 was too timid: on a lake that had
