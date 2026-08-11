@@ -32,6 +32,10 @@ DEFAULT_MAX_PENDING_DELETES = 100_000_000
 MID_SYNC_DELETE_THRESHOLD = 0.05
 MIN_DELETE_THRESHOLD = 0.01
 
+# A resource this large is held to a stricter backlog limit before it is applied.
+# Duke's ~1.1M-record (582MB) delta died at a backlog a small delta shrugs off.
+BIG_RESOURCE_BYTES = 100 * 1024 * 1024
+
 # Backlog beyond which an unbounded rewrite is worth warning about up front.
 _BIG_DELETE_BACKLOG = 500_000_000
 
@@ -384,15 +388,33 @@ def sync_all(
         con.close()
 
 
+def _delete_limit_for(resource_bytes: int, max_pending: int) -> int:
+    """
+    The backlog we're willing to carry into applying a resource of this size.
+
+    What actually kills a sync is a *large* resource meeting a *moderate*
+    backlog: the delete pays for both the tombstones it creates and every
+    tombstone already on the files it opens. Small deltas survive a backlog that
+    a big one cannot, so hold big ones to a stricter limit rather than picking a
+    single number that is either too lax for the big resources or needlessly
+    aggressive for the long tail of small ones. Resource sizes come from the
+    ResourceSync manifest, so this is known before anything is downloaded.
+    """
+    if resource_bytes >= BIG_RESOURCE_BYTES:
+        return max(1, max_pending // 2)
+    return max_pending
+
+
 def _maybe_apply_deletes(
     con: duckdb.DuckDBPyConnection,
     org: str,
     pos: str,
-    max_pending: int,
+    limit: int,
     state: dict,
 ) -> None:
     """
-    Apply the accumulated delete backlog if it has grown past `max_pending`.
+    Apply the accumulated delete backlog if it exceeds `limit`, before it makes
+    the next apply too expensive.
 
     A long delta chain makes its own deletes progressively more expensive: each
     one adds tombstones, and every later DELETE loads the delete history of the
@@ -405,14 +427,16 @@ def _maybe_apply_deletes(
     rewrite comes up short we therefore get *more aggressive* (halve the
     threshold) rather than tolerating a bigger backlog: raising the trigger would
     just defer the OOM to a later, larger resource. Only once the threshold
-    bottoms out is the backlog genuinely irreducible, and then we say so.
+    bottoms out is the backlog genuinely irreducible; we record that floor and
+    stop retrying below it, so we don't pay for compactions that cannot help.
     """
-    limit = state.get("limit", max_pending)
     if not limit:
         return
     _, pending_rows = lake.pending_deletes(con)
     if pending_rows <= limit:
         return
+    if pending_rows <= state.get("floor", 0):
+        return  # already proven irreducible at the lowest threshold
 
     threshold = state.get("threshold", MID_SYNC_DELETE_THRESHOLD)
     typer.echo(
@@ -440,8 +464,9 @@ def _maybe_apply_deletes(
         )
         return
 
-    # Threshold is as low as it goes and the backlog still won't come down.
-    state["limit"] = int(after * 1.5)
+    # Threshold is as low as it goes and the backlog still won't come down. Record
+    # the floor so later resources don't keep paying for compactions that can't help.
+    state["floor"] = after
     typer.echo(
         f"  {pos} {org}: [warning] {after:,} tombstoned rows could not be reclaimed "
         f"even at threshold {threshold}. Later deltas may run out of memory; if one "
@@ -474,6 +499,15 @@ def _sync_org(
     delete_state: dict = {}
     for i, resource in enumerate(pending, 1):
         pos = f"[{i}/{total}]"
+        # Clear the backlog *before* applying, while we still know how big this
+        # resource is — a large one gets a stricter limit than a small one.
+        _maybe_apply_deletes(
+            con,
+            org,
+            pos,
+            _delete_limit_for(resource.length, max_pending_deletes),
+            delete_state,
+        )
         with tempfile.TemporaryDirectory() as tmp:
             if resource.kind == "deletes":
                 del_path = Path(tmp) / "deletes.txt"
@@ -526,7 +560,6 @@ def _sync_org(
                     con, org, resource.kind, (records_pq, meta_pq), resource.lastmod
                 )
                 total_changed += changed
-        _maybe_apply_deletes(con, org, pos, max_pending_deletes, delete_state)
     return total_changed, total_deleted, total
 
 
