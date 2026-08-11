@@ -1,3 +1,4 @@
+import logging
 import tempfile
 from pathlib import Path
 from typing import Annotated
@@ -13,6 +14,17 @@ from podlake.config import Config, get_config
 from podlake.convert import dump_to_parquet
 
 app = typer.Typer()
+
+
+def _setup_logging(verbose: bool) -> None:
+    """Surface INFO logs (per-step apply timings) when --verbose is passed.
+    force=True because basicConfig is a no-op if the root logger is already
+    configured, which would silently swallow the output."""
+    if verbose:
+        logging.basicConfig(
+            level=logging.INFO, format="%(asctime)s  %(message)s", force=True
+        )
+
 
 # Tombstoned rows a DELETE has to load before it gets dangerous. Every DELETE
 # loads the delete history of each data file it opens, off-pool and not bounded
@@ -321,12 +333,22 @@ def sync(
             "its own memory use until it fails. Raise it on a machine with more RAM.",
         ),
     ] = DEFAULT_MAX_PENDING_DELETES,
+    verbose: Annotated[
+        bool,
+        typer.Option(
+            "--verbose",
+            "-v",
+            help="Log each apply step (delete/insert/commit) with timings, so a "
+            "pause or a memory spike can be pinned to a specific statement.",
+        ),
+    ] = False,
 ):
     """
     Sync one organization from POD ResourceSync into the DuckLake. Processes
     every resource (full dump + deltas + deletes) newer than the org's cursor:
     the first run does a full initial load, later runs apply only new deltas.
     """
+    _setup_logging(verbose)
     get_config()
     found = resourcesync.get_streams(org_name)
     if not found:
@@ -366,12 +388,22 @@ def sync_all(
             "its own memory use until it fails. Raise it on a machine with more RAM.",
         ),
     ] = DEFAULT_MAX_PENDING_DELETES,
+    verbose: Annotated[
+        bool,
+        typer.Option(
+            "--verbose",
+            "-v",
+            help="Log each apply step (delete/insert/commit) with timings, so a "
+            "pause or a memory spike can be pinned to a specific statement.",
+        ),
+    ] = False,
 ):
     """
     Sync every organization from POD ResourceSync into the DuckLake, one at a
     time. Each resource is its own transaction (DuckLake snapshot), so an
     interrupted run resumes cleanly from where it left off.
     """
+    _setup_logging(verbose)
     get_config()
 
     con = lake.connect(read_only=False)

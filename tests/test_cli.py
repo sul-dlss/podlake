@@ -254,3 +254,18 @@ def test_sync_loads_into_lake(tmp_path, monkeypatch):
     ]
     assert ids == ["brown:a1"]
     con.close()
+
+
+def test_sync_verbose_logs_apply_steps(tmp_path, monkeypatch):
+    """--verbose must actually surface the per-statement markers: they are what
+    pins a stall or memory spike to a specific step (delete vs insert)."""
+    _patch(monkeypatch)
+    monkeypatch.setenv("PODLAKE_PROFILE", "file")
+    monkeypatch.setenv("PODLAKE_CATALOG", str(tmp_path / "podlake.ducklake"))
+    monkeypatch.setenv("PODLAKE_DATA_PATH", str(tmp_path / "data") + "/")
+
+    result = runner.invoke(app, ["sync", "brown", "--verbose"])
+    assert result.exit_code == 0, result.output
+    assert "brown full: delete records" in result.output
+    assert "brown full: insert records" in result.output
+    assert "brown full: commit" in result.output
