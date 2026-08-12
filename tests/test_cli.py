@@ -397,3 +397,18 @@ def test_backlog_check_disabled_by_zero(monkeypatch):
     tried = _fake_backlog(monkeypatch, 900_000_000, lambda t: 900_000_000)
     cli._maybe_apply_deletes(_con(), "x", "[1/1]", 1, 0, {})
     assert tried == []
+
+
+def test_sync_all_reports_a_run_total(tmp_path, monkeypatch):
+    """A cron log wants a one-line verdict for the run, not just per-org lines."""
+    _patch(monkeypatch)
+    monkeypatch.setenv("PODLAKE_PROFILE", "file")
+    monkeypatch.setenv("PODLAKE_CATALOG", str(tmp_path / "podlake.ducklake"))
+    monkeypatch.setenv("PODLAKE_DATA_PATH", str(tmp_path / "data") + "/")
+
+    result = runner.invoke(app, ["sync-all"])
+    assert result.exit_code == 0, result.output
+    # brown fixture: full (a1,a2) then delta (a1,a2) = 4 changed, then 1 deleted
+    assert "total: 3 resources from 1 organization" in result.output
+    assert "4 records changed" in result.output
+    assert "1 deleted" in result.output

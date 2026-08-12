@@ -1,6 +1,7 @@
 import logging
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Annotated
 
@@ -461,6 +462,9 @@ def sync_all(
     _setup_logging(verbose, log)
     get_config()
 
+    started = time.monotonic()
+    orgs = total_resources = total_changed = total_deleted = 0
+
     con = _connect_writable()
     try:
         for name, url in sorted(resourcesync.get_streams().items()):
@@ -472,8 +476,23 @@ def sync_all(
                 f"[bold]{name}[/bold]: {n} resources processed, "
                 f"{changed} changed, {deleted} deleted",
             )
+            if n:
+                orgs += 1
+            total_resources += n
+            total_changed += changed
+            total_deleted += deleted
     finally:
         con.close()
+
+    # A one-line verdict for the whole run, so a cron log (or --log file) can be
+    # skimmed without reading every per-org line.
+    elapsed = humanize.naturaldelta(time.monotonic() - started)
+    line = (
+        f"total: {total_resources:,} resources from {orgs} "
+        f"organization{'' if orgs == 1 else 's'}, "
+        f"{total_changed:,} records changed, {total_deleted:,} deleted, in {elapsed}"
+    )
+    _summary(line, f"[bold]{line}[/bold]")
 
 
 def _delete_limit_for(resource_bytes: int, max_pending: int, floor: int) -> int:
