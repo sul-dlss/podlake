@@ -56,7 +56,7 @@ def _resources():
     ]
 
 
-def _fake_download(url, path, fixity=None, desc=None):
+def _fake_download(url, path, fixity=None, desc=None, quiet=False):
     if url.endswith(".del.txt"):
         path.write_text("a2\n")  # delete record a2
     else:
@@ -175,6 +175,66 @@ def test_compact_dry_run_command(tmp_path, monkeypatch):
     assert "dry run" in result.output
 
 
+def test_compact_applies_deletes_by_default(tmp_path, monkeypatch):
+    """The delete-rewrite is on by default: leaving it opt-in is how a backlog
+    silently accumulates until DELETEs stop fitting in memory."""
+    monkeypatch.setenv("PODLAKE_PROFILE", "file")
+    monkeypatch.setenv("PODLAKE_CATALOG", str(tmp_path / "podlake.ducklake"))
+    monkeypatch.setenv("PODLAKE_DATA_PATH", str(tmp_path / "data") + "/")
+
+    config = get_config()
+    con = lake.connect(read_only=False, config=config)
+    lake.ensure_schema(con)
+    con.execute(
+        "INSERT INTO records SELECT 'x', 'x:' || i, '245', 1, '1', '0', 'a', 0, "
+        "'t' || i FROM range(50000) s(i)"
+    )
+    con.execute(
+        "DELETE FROM records WHERE org = 'x' "
+        "AND (CAST(substr(pod_record_id, 3) AS INTEGER) % 5) = 0"
+    )
+    assert lake.pending_deletes(con)[1] > 0
+    con.close()
+
+    # --no-rewrite-deletes leaves the backlog in place
+    result = runner.invoke(app, ["compact", "--no-rewrite-deletes"])
+    assert result.exit_code == 0, result.output
+    con = lake.connect(read_only=True, config=config)
+    assert lake.pending_deletes(con)[1] > 0
+    con.close()
+
+    # the default run applies it
+    result = runner.invoke(app, ["compact"])
+    assert result.exit_code == 0, result.output
+    assert "pending deletes" in result.output
+    con = lake.connect(read_only=True, config=config)
+    assert lake.pending_deletes(con) == (0, 0)
+    assert con.execute("SELECT count(*) FROM records").fetchone() == (40000,)
+    con.close()
+
+
+def test_sync_applies_deletes_when_backlog_exceeds_threshold(tmp_path, monkeypatch):
+    _patch(monkeypatch)
+    monkeypatch.setenv("PODLAKE_PROFILE", "file")
+    monkeypatch.setenv("PODLAKE_CATALOG", str(tmp_path / "podlake.ducklake"))
+    monkeypatch.setenv("PODLAKE_DATA_PATH", str(tmp_path / "data") + "/")
+
+    # a threshold of 1 row makes every resource trip the mid-sync check; the sync
+    # must still finish and leave the lake correct
+    result = runner.invoke(app, ["sync", "brown", "--max-pending-deletes", "1"])
+    assert result.exit_code == 0, result.output
+
+    con = lake.connect(read_only=True, config=get_config())
+    ids = [
+        r[0]
+        for r in con.execute(
+            "SELECT pod_record_id FROM record_meta ORDER BY pod_record_id"
+        ).fetchall()
+    ]
+    assert ids == ["brown:a1"]
+    con.close()
+
+
 def test_sync_loads_into_lake(tmp_path, monkeypatch):
     _patch(monkeypatch)
     monkeypatch.setenv("PODLAKE_PROFILE", "file")
@@ -194,3 +254,146 @@ def test_sync_loads_into_lake(tmp_path, monkeypatch):
     ]
     assert ids == ["brown:a1"]
     con.close()
+
+
+def test_sync_verbose_logs_apply_steps(tmp_path, monkeypatch):
+    """--verbose must actually surface the per-statement markers: they are what
+    pins a stall or memory spike to a specific step (delete vs insert)."""
+    _patch(monkeypatch)
+    monkeypatch.setenv("PODLAKE_PROFILE", "file")
+    monkeypatch.setenv("PODLAKE_CATALOG", str(tmp_path / "podlake.ducklake"))
+    monkeypatch.setenv("PODLAKE_DATA_PATH", str(tmp_path / "data") + "/")
+
+    result = runner.invoke(app, ["sync", "brown", "--verbose"])
+    assert result.exit_code == 0, result.output
+    assert "brown full: delete records" in result.output
+    assert "brown full: insert records" in result.output
+    assert "brown full: commit" in result.output
+
+
+def test_sync_log_file_quiets_console(tmp_path, monkeypatch):
+    """--log sends progress to a file and leaves stdout/stderr quiet, so a cron
+    run only mails on failure."""
+    _patch(monkeypatch)
+    monkeypatch.setenv("PODLAKE_PROFILE", "file")
+    monkeypatch.setenv("PODLAKE_CATALOG", str(tmp_path / "podlake.ducklake"))
+    monkeypatch.setenv("PODLAKE_DATA_PATH", str(tmp_path / "data") + "/")
+    log = tmp_path / "sync.log"
+
+    result = runner.invoke(app, ["sync", "brown", "--log", str(log)])
+    assert result.exit_code == 0, result.output
+    assert result.output.strip() == ""
+
+    written = log.read_text()
+    assert "downloading" in written
+    assert "resources processed" in written
+    # httpx's per-request chatter would bury our progress lines
+    assert "HTTP Request" not in written
+
+
+def test_delete_limit_never_below_known_floor():
+    """Demanding a backlog the rewrite has already failed to reach just burns
+    compaction cycles, so the floor wins over the big-resource limit."""
+    from podlake.cli import BIG_RESOURCE_BYTES, _delete_limit_for
+
+    small, big = 1, BIG_RESOURCE_BYTES
+    assert _delete_limit_for(small, 100_000_000, 0) == 100_000_000
+    assert _delete_limit_for(big, 100_000_000, 0) == 50_000_000
+    # a proven floor above the strict limit raises it rather than chasing 50M
+    assert _delete_limit_for(big, 100_000_000, 76_000_000) == 76_000_000
+
+
+def test_log_silences_duckdb_progress_bar(tmp_path, monkeypatch):
+    """--log must also turn off DuckDB's own progress bar; connect() enables it
+    for any TTY, so the log file alone would not keep an interactive console
+    quiet. CliRunner is not a TTY, so assert the setting directly."""
+    monkeypatch.setenv("PODLAKE_PROFILE", "file")
+    monkeypatch.setenv("PODLAKE_CATALOG", str(tmp_path / "podlake.ducklake"))
+    monkeypatch.setenv("PODLAKE_DATA_PATH", str(tmp_path / "data") + "/")
+
+    from podlake import cli
+
+    cli._setup_logging(False, tmp_path / "x.log")
+    try:
+        con = cli._connect_writable(get_config())
+        assert con.execute(
+            "SELECT current_setting('enable_progress_bar')"
+        ).fetchone() == (False,)
+        con.close()
+    finally:
+        cli._setup_logging(False, None)
+
+
+def test_compact_supports_log(tmp_path, monkeypatch):
+    monkeypatch.setenv("PODLAKE_PROFILE", "file")
+    monkeypatch.setenv("PODLAKE_CATALOG", str(tmp_path / "podlake.ducklake"))
+    monkeypatch.setenv("PODLAKE_DATA_PATH", str(tmp_path / "data") + "/")
+    log = tmp_path / "compact.log"
+
+    result = runner.invoke(app, ["compact", "--log", str(log)])
+    assert result.exit_code == 0, result.output
+    assert result.output.strip() == ""
+    assert "pending deletes" in log.read_text()
+
+
+def _con():
+    """A throwaway connection; the lake calls under test are all monkeypatched."""
+    return duckdb.connect()
+
+
+def _fake_backlog(monkeypatch, pending, after):
+    """Drive _maybe_apply_deletes with a scripted backlog. Returns the list of
+    thresholds the rewrite was actually asked for."""
+    from podlake import cli
+
+    tried = []
+    monkeypatch.setattr(cli.lake, "pending_deletes", lambda con: (1, pending))
+
+    def fake_compact(con, *, days, rewrite_deletes):
+        tried.append(rewrite_deletes)
+        return {
+            "deleted_rows_before": pending,
+            "deleted_rows_after": after(rewrite_deletes),
+            "rewritten": 1,
+        }
+
+    monkeypatch.setattr(cli.lake, "compact", fake_compact)
+    return tried
+
+
+def test_backlog_escalates_then_records_floor(monkeypatch):
+    """When no threshold can get under the limit, halve down to the minimum and
+    remember the floor — rather than give up early or retry forever."""
+    from podlake import cli
+
+    tried = _fake_backlog(monkeypatch, 200_000_000, lambda t: 200_000_000)
+    state: dict = {}
+    cli._maybe_apply_deletes(_con(), "x", "[1/1]", 1, 100_000_000, state)
+
+    assert tried == [0.05, 0.025, 0.0125, 0.01]  # stops at the minimum
+    assert state["floor"] == 200_000_000
+
+    # a later resource at or below the floor must not pay for the ladder again
+    tried.clear()
+    cli._maybe_apply_deletes(_con(), "x", "[2/2]", 1, 100_000_000, state)
+    assert tried == []
+
+
+def test_backlog_stops_as_soon_as_it_is_under_the_limit(monkeypatch):
+    """The cheap threshold suffices, so don't escalate or record a floor."""
+    from podlake import cli
+
+    tried = _fake_backlog(monkeypatch, 200_000_000, lambda t: 50_000_000)
+    state: dict = {}
+    cli._maybe_apply_deletes(_con(), "x", "[1/1]", 1, 100_000_000, state)
+
+    assert tried == [0.05]
+    assert "floor" not in state
+
+
+def test_backlog_check_disabled_by_zero(monkeypatch):
+    from podlake import cli
+
+    tried = _fake_backlog(monkeypatch, 900_000_000, lambda t: 900_000_000)
+    cli._maybe_apply_deletes(_con(), "x", "[1/1]", 1, 0, {})
+    assert tried == []

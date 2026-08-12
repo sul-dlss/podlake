@@ -1,6 +1,7 @@
 import logging
 import sys
 import tempfile
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -175,6 +176,30 @@ def _naive_utc(dt: datetime) -> datetime:
     return dt.replace(tzinfo=None)
 
 
+def _timed(
+    con: duckdb.DuckDBPyConnection,
+    label: str,
+    sql: str,
+    params: list | None = None,
+) -> None:
+    """
+    Run one statement, logging a marker before it and the elapsed time after.
+
+    `apply_resource` runs several statements in a single transaction with no
+    progress of its own, so at INFO level (`sync --verbose`) these boundaries
+    show which step is executing. The last unmatched "→" before a stall or a
+    memory spike names the culprit — which is how the delete was first isolated
+    from the insert.
+    """
+    logger.info("→ %s", label)
+    start = time.perf_counter()
+    if params is None:
+        con.execute(sql)
+    else:
+        con.execute(sql, params)
+    logger.info("← %s (%.1fs)", label, time.perf_counter() - start)
+
+
 def apply_resource(
     con: duckdb.DuckDBPyConnection,
     org: str,
@@ -209,21 +234,29 @@ def apply_resource(
             # data to find this resource's ids — a full-table scan that is very
             # slow on a multi-org lake. Every id in the resource belongs to
             # `org`, so restricting to it is safe.
-            con.execute(
+            _timed(
+                con,
+                f"{org} {kind}: delete records",
                 f"DELETE FROM {RECORDS_TABLE} "
                 f"WHERE org = ? AND pod_record_id IN {ids_subquery}",
                 [org, str(meta_pq)],
             )
-            con.execute(
+            _timed(
+                con,
+                f"{org} {kind}: delete record_meta",
                 f"DELETE FROM {META_TABLE} "
                 f"WHERE org = ? AND pod_record_id IN {ids_subquery}",
                 [org, str(meta_pq)],
             )
-            con.execute(
+            _timed(
+                con,
+                f"{org} {kind}: insert records",
                 f"INSERT INTO {RECORDS_TABLE} SELECT * FROM read_parquet(?)",
                 [str(records_pq)],
             )
-            con.execute(
+            _timed(
+                con,
+                f"{org} {kind}: insert record_meta",
                 f"INSERT INTO {META_TABLE} SELECT * FROM read_parquet(?)",
                 [str(meta_pq)],
             )
@@ -242,12 +275,16 @@ def apply_resource(
                 con.register("delete_ids", pa.table({"pod_record_id": payload}))
                 try:
                     id_subquery = "(SELECT pod_record_id FROM delete_ids)"
-                    con.execute(
+                    _timed(
+                        con,
+                        f"{org} deletes: delete records",
                         f"DELETE FROM {RECORDS_TABLE} "
                         f"WHERE org = ? AND pod_record_id IN {id_subquery}",
                         [org],
                     )
-                    con.execute(
+                    _timed(
+                        con,
+                        f"{org} deletes: delete record_meta",
                         f"DELETE FROM {META_TABLE} "
                         f"WHERE org = ? AND pod_record_id IN {id_subquery}",
                         [org],
@@ -259,7 +296,7 @@ def apply_resource(
             raise ValueError(f"unknown resource kind: {kind}")
 
         _set_cursor(con, org, last_modified)
-        con.execute("COMMIT")
+        _timed(con, f"{org} {kind}: commit", "COMMIT")
     except Exception:
         con.execute("ROLLBACK")
         raise
@@ -320,8 +357,35 @@ def _snapshot_count(con: duckdb.DuckDBPyConnection) -> int:
     return row[0] if row else 0
 
 
+def pending_deletes(con: duckdb.DuckDBPyConnection) -> tuple[int, int]:
+    """
+    Return (delete_files, deleted_rows) still tombstoned but not yet physically
+    removed from their data files. See the README's "delete backlog" section for
+    why this number governs how much memory a DELETE needs.
+
+    Errors are deliberately *not* swallowed: reporting an empty backlog when we
+    simply failed to read it would silently disable the mid-sync safeguard that
+    depends on this. An unbuilt lake is the one legitimate zero.
+    """
+    if not _table_exists(con, RECORDS_TABLE):
+        return (0, 0)
+    # DuckLake's bookkeeping lives in a side catalog, not in the lake itself
+    row = con.execute(
+        "SELECT count(*), coalesce(sum(delete_count), 0) "
+        f"FROM __ducklake_metadata_{LAKE_ALIAS}.ducklake_delete_file "
+        "WHERE end_snapshot IS NULL"
+    ).fetchone()
+    return (int(row[0]), int(row[1])) if row else (0, 0)
+
+
 def compact(
-    con: duckdb.DuckDBPyConnection, *, days: int = 0, dry_run: bool = False
+    con: duckdb.DuckDBPyConnection,
+    *,
+    days: int = 0,
+    dry_run: bool = False,
+    rewrite_deletes: float | None = None,
+    max_files: int | None = None,
+    max_passes: int = 10,
 ) -> dict[str, int]:
     """
     Reclaim disk in the attached lake. DuckLake is merge-on-read, so superseded
@@ -329,44 +393,110 @@ def compact(
     this runs. It expires snapshots older than `days` days (0 = all but the
     current), compacts small Parquet files, then deletes the data files no longer
     referenced by a live snapshot. With dry_run=True nothing changes and the
-    counts report what *would* be reclaimed. Returns a stats dict.
+    counts report what *would* be reclaimed.
+
+    `rewrite_deletes` additionally rewrites data files to physically apply their
+    accumulated deletes, for files where the deleted fraction is at least that
+    value (0.05 = 5%). This is the only step that clears tombstoned rows out of
+    *large* data files: `merge_adjacent_files` skips any file already at the
+    target size, and DuckLake's own `rewrite_data_files` defaults to a 0.95
+    threshold, so without this a big file's deletes accumulate forever. It
+    rewrites real data, so it is much more expensive than the other steps — use
+    `max_files` to bound one run and re-run to make progress incrementally.
+
+    A single expire → merge → cleanup pass never fully compacts: merging creates
+    new snapshots and freshly-superseded files that only become collectable once
+    a *later* expire pass removes the snapshots referencing them. So the cleanup
+    cycle repeats until a pass reclaims nothing (or `max_passes`). Returns a
+    stats dict, including the number of cleanup `passes` run.
     """
     dry = "true" if dry_run else "false"
     older_than = f"now() - INTERVAL '{int(days)} days'"
 
-    def run(fn: str) -> int:
+    def run(fn: str, measure: str = "count(*)") -> int:
         # Materialize via CTAS so the side-effecting table function runs fully: a
         # bare count() can be optimized away, and fetching the functions'
         # TIMESTAMPTZ columns into Python would require pytz. The temp table keeps
         # the timestamps inside DuckDB.
         con.execute(f"CREATE OR REPLACE TEMP TABLE _compact AS SELECT * FROM {fn}")
-        row = con.execute("SELECT count(*) FROM _compact").fetchone()
-        return row[0] if row else 0
+        row = con.execute(f"SELECT {measure} FROM _compact").fetchone()
+        return int(row[0]) if row else 0
+
+    # the rewrite returns a row per table/compaction group, not per file
+    FILES = "coalesce(sum(files_processed), 0)"
 
     before = _snapshot_count(con)
-    expired = run(
-        f"ducklake_expire_snapshots('{LAKE_ALIAS}', "
-        f"dry_run => {dry}, older_than => {older_than})"
-    )
-    # merge has no dry-run mode, so only compact for real runs
-    merged = 0 if dry_run else run(f"ducklake_merge_adjacent_files('{LAKE_ALIAS}')")
-    cleaned = run(
-        f"ducklake_cleanup_old_files('{LAKE_ALIAS}', "
-        f"dry_run => {dry}, cleanup_all => true)"
-    )
-    orphaned = run(
-        f"ducklake_delete_orphaned_files('{LAKE_ALIAS}', "
-        f"dry_run => {dry}, cleanup_all => true)"
-    )
+    delete_files_before, deleted_rows_before = pending_deletes(con)
+
+    # Apply accumulated deletes first, so the cleanup cycle below can collect the
+    # data + delete files the rewrite supersedes. No dry-run mode upstream.
+    rewritten = 0
+    if rewrite_deletes is not None and not dry_run:
+        threshold = f"delete_threshold => {float(rewrite_deletes)}"
+        logger.info(
+            "rewriting data files with >=%s%% deletes (%s delete files, %s rows)",
+            float(rewrite_deletes) * 100,
+            f"{delete_files_before:,}",
+            f"{deleted_rows_before:,}",
+        )
+        fn = f"ducklake_rewrite_data_files('{LAKE_ALIAS}', {threshold}"
+        try:
+            bounded = fn + (
+                f", max_compacted_files => {int(max_files)})"
+                if max_files is not None
+                else ")"
+            )
+            rewritten = run(bounded, FILES)
+        except duckdb.Error as e:
+            # max_compacted_files was added to ducklake_rewrite_data_files after
+            # some released versions; without it the rewrite can't be bounded, so
+            # say so rather than silently doing the whole backlog in one run.
+            if max_files is None or "max_compacted_files" not in str(e):
+                raise
+            logger.warning(
+                "this DuckLake version does not support max_compacted_files — "
+                "rewriting the whole backlog in one pass (this may take a long time)"
+            )
+            rewritten = run(fn + ")", FILES)
+
+    totals = {"expired": 0, "merged": 0, "cleaned": 0, "orphaned": 0, "passes": 0}
+    while totals["passes"] < max_passes:
+        expired = run(
+            f"ducklake_expire_snapshots('{LAKE_ALIAS}', "
+            f"dry_run => {dry}, older_than => {older_than})"
+        )
+        # merge has no dry-run mode, so only compact for real runs
+        merged = 0 if dry_run else run(f"ducklake_merge_adjacent_files('{LAKE_ALIAS}')")
+        cleaned = run(
+            f"ducklake_cleanup_old_files('{LAKE_ALIAS}', "
+            f"dry_run => {dry}, cleanup_all => true)"
+        )
+        orphaned = run(
+            f"ducklake_delete_orphaned_files('{LAKE_ALIAS}', "
+            f"dry_run => {dry}, cleanup_all => true)"
+        )
+        totals["expired"] += expired
+        totals["merged"] += merged
+        totals["cleaned"] += cleaned
+        totals["orphaned"] += orphaned
+        totals["passes"] += 1
+        # dry runs never mutate (so looping is pointless); real runs stop once a
+        # pass leaves everything in place — the fixed point.
+        if dry_run or expired + merged + cleaned + orphaned == 0:
+            break
+
     con.execute("DROP TABLE IF EXISTS _compact")
+    delete_files_after, deleted_rows_after = pending_deletes(con)
 
     stats = {
+        **totals,
         "snapshots_before": before,
         "snapshots_after": _snapshot_count(con),
-        "expired": expired,
-        "merged": merged,
-        "cleaned": cleaned,
-        "orphaned": orphaned,
+        "rewritten": rewritten,
+        "delete_files_before": delete_files_before,
+        "delete_files_after": delete_files_after,
+        "deleted_rows_before": deleted_rows_before,
+        "deleted_rows_after": deleted_rows_after,
     }
     logger.info("compact: %s", stats)
     return stats

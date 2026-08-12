@@ -1,3 +1,5 @@
+import logging
+import sys
 import tempfile
 from pathlib import Path
 from typing import Annotated
@@ -13,6 +15,121 @@ from podlake.config import Config, get_config
 from podlake.convert import dump_to_parquet
 
 app = typer.Typer()
+
+MaxPendingDeletes = Annotated[
+    int,
+    typer.Option(
+        "--max-pending-deletes",
+        help="Apply accumulated deletes mid-sync whenever the backlog exceeds this "
+        "many tombstoned rows (0 disables). Raise it on a machine with more RAM.",
+    ),
+]
+Verbose = Annotated[
+    bool,
+    typer.Option(
+        "--verbose",
+        "-v",
+        help="Log each apply step (delete/insert/commit) with timings, so a pause "
+        "or a memory spike can be pinned to a specific statement.",
+    ),
+]
+LogFile = Annotated[
+    Path | None,
+    typer.Option(
+        "--log",
+        help="Write progress to this file instead of the terminal, and turn off "
+        "progress bars. Console stays quiet, so a cron run only mails you on "
+        "failure.",
+    ),
+]
+
+
+logger = logging.getLogger(__name__)
+
+# Set by --log: progress goes to the log file and the console stays quiet, so a
+# cron run only mails you when something actually fails.
+_LOGGING_TO_FILE = False
+
+
+def _setup_logging(verbose: bool, log: Path | None = None) -> None:
+    """Route INFO logs to a file (--log) or the console (--verbose). force=True
+    because basicConfig is a no-op if the root logger is already configured,
+    which would silently swallow the output."""
+    global _LOGGING_TO_FILE
+    _LOGGING_TO_FILE = log is not None
+    fmt = "%(asctime)s  %(message)s"
+    if log is not None:
+        logging.basicConfig(
+            level=logging.INFO, format=fmt, filename=str(log), force=True
+        )
+    elif verbose:
+        logging.basicConfig(level=logging.INFO, format=fmt, force=True)
+    # INFO on the root logger otherwise pulls in httpx's line per request, which
+    # buries our own progress under hundreds of "HTTP Request: GET ..." lines.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+
+
+def _connect_writable(config: Config | None = None) -> duckdb.DuckDBPyConnection:
+    """Open a write connection, silencing DuckDB's progress bar when --log is in
+    effect — connect() turns it on for any TTY, which would otherwise leave the
+    console noisy despite the log file."""
+    con = lake.connect(read_only=False, config=config)
+    if _LOGGING_TO_FILE:
+        con.execute("SET enable_progress_bar = false")
+    return con
+
+
+def _download_bar_hidden() -> bool:
+    """Whether the download's own progress bar will be invisible — because we're
+    logging to a file, or stderr isn't a terminal (cron, or piped through tee)."""
+    return _LOGGING_TO_FILE or not sys.stderr.isatty()
+
+
+def _progress(msg: str) -> None:
+    """A progress line: into the log file with --log, otherwise onto stderr."""
+    if _LOGGING_TO_FILE:
+        logger.info(msg)
+    else:
+        typer.echo(msg, err=True)
+
+
+def _summary(plain: str, rich_markup: str) -> None:
+    """An end-of-command summary: logged with --log, printed otherwise."""
+    if _LOGGING_TO_FILE:
+        logger.info(plain)
+    else:
+        print(rich_markup)
+
+
+# Backlog thresholds for the delete-rewrite. See the README's "delete backlog"
+# section for why these matter; the numbers come from a 32GB box, where a 0.05
+# rewrite bottomed out near 76M rows and a 1.1M-record delta died at 153M. The
+# safe level scales with RAM and with how large the incoming resources are.
+DEFAULT_MAX_PENDING_DELETES = 100_000_000
+MID_SYNC_DELETE_THRESHOLD = 0.05
+MIN_DELETE_THRESHOLD = 0.01
+
+
+def _threshold_ladder() -> list[float]:
+    """Rewrite thresholds to try in one pass, cheapest first, halving down to the
+    minimum. A fixed list rather than a loop condition: the escalation is then
+    bounded by construction, and cannot spin if a comparison is ever wrong."""
+    ladder = []
+    t = MID_SYNC_DELETE_THRESHOLD
+    while t > MIN_DELETE_THRESHOLD and len(ladder) < 8:
+        ladder.append(t)
+        t /= 2
+    ladder.append(MIN_DELETE_THRESHOLD)
+    return ladder
+
+
+THRESHOLD_LADDER = _threshold_ladder()
+
+# Resources at least this large are held to a stricter backlog limit.
+BIG_RESOURCE_BYTES = 100 * 1024 * 1024
+
+# Backlog big enough that an unbounded rewrite is worth warning about first.
+BIG_DELETE_BACKLOG = 500_000_000
 
 
 @app.command()
@@ -187,32 +304,95 @@ def compact(
             help="Report what would be reclaimed without changing anything.",
         ),
     ] = False,
+    delete_threshold: Annotated[
+        float,
+        typer.Option(
+            "--delete-threshold",
+            help="Rewrite data files that are at least this fraction deleted, to "
+            "physically apply their accumulated deletes (0.1 = 10%). Lower reclaims "
+            "more but costs much more per row reclaimed.",
+            min=0.0,
+            max=1.0,
+        ),
+    ] = 0.1,
+    no_rewrite_deletes: Annotated[
+        bool,
+        typer.Option(
+            "--no-rewrite-deletes",
+            help="Skip applying accumulated deletes, for a quick disk-only pass. "
+            "Note this leaves tombstoned rows in place, which makes later DELETEs "
+            "progressively more expensive.",
+        ),
+    ] = False,
+    max_files: Annotated[
+        int | None,
+        typer.Option(
+            "--max-files",
+            help="Cap how many files the delete-rewrite handles in one run, so a "
+            "huge backlog can be worked through a chunk at a time. (Requires a "
+            "DuckLake version that supports max_compacted_files.)",
+        ),
+    ] = None,
+    log: LogFile = None,
 ):
     """
-    Reclaim disk space. DuckLake is merge-on-read, so superseded rows from
-    deltas/deletes and re-imported full dumps accumulate on disk until this runs:
-    it expires old snapshots, compacts small Parquet files, and deletes the data
-    files no longer referenced by a live snapshot.
+    Reclaim disk space and keep writes fast. DuckLake is merge-on-read, so
+    superseded rows from deltas/deletes and re-imported full dumps accumulate on
+    disk until this runs: it expires old snapshots, compacts small Parquet files,
+    applies accumulated deletes, and removes data files no longer referenced by a
+    live snapshot.
+
+    Applying deletes matters for more than disk. Every DELETE loads the full
+    delete history of each data file it opens, so an unapplied backlog makes
+    deltas progressively slower and more memory-hungry until they fail outright.
+    Merging small files does not clear it — that is what the delete-rewrite is
+    for, and why it is on by default.
     """
+    _setup_logging(False, log)
     config = get_config()
-    con = lake.connect(read_only=False, config=config)
+    con = _connect_writable(config)
     try:
-        s = lake.compact(con, days=older_than_days, dry_run=dry_run)
+        if not no_rewrite_deletes and not dry_run and max_files is None:
+            _, pending_rows = lake.pending_deletes(con)
+            if pending_rows > BIG_DELETE_BACKLOG:
+                _summary(
+                    f"{pending_rows:,} tombstoned rows to apply — this may take a "
+                    "long time and cannot be interrupted for partial credit",
+                    f"[yellow]{pending_rows:,} tombstoned rows to apply — this may "
+                    "take a long time, and cannot be interrupted for partial credit. "
+                    "Consider --max-files, or a higher --delete-threshold first.[/yellow]",
+                )
+        s = lake.compact(
+            con,
+            days=older_than_days,
+            dry_run=dry_run,
+            rewrite_deletes=None if no_rewrite_deletes else delete_threshold,
+            max_files=max_files,
+        )
     finally:
         con.close()
 
     if dry_run:
-        print(
+        line = (
             f"dry run — would expire {s['expired']} snapshot(s) and delete "
             f"{s['cleaned']} old + {s['orphaned']} orphaned data files "
             f"(snapshots stay at {s['snapshots_before']})"
         )
     else:
-        print(
-            f"snapshots {s['snapshots_before']} → {s['snapshots_after']}; "
+        line = (
+            f"snapshots {s['snapshots_before']} → {s['snapshots_after']} "
+            f"in {s['passes']} pass(es); "
             f"expired {s['expired']}, merged {s['merged']}, "
             f"deleted {s['cleaned']} old + {s['orphaned']} orphaned data files"
         )
+    _summary(line, line)
+    backlog = (
+        f"pending deletes: {s['delete_files_before']:,} files / "
+        f"{s['deleted_rows_before']:,} rows → "
+        f"{s['delete_files_after']:,} files / {s['deleted_rows_after']:,} rows"
+        + (f" ({s['rewritten']} file(s) rewritten)" if s["rewritten"] else "")
+    )
+    _summary(backlog, backlog)
 
 
 @app.command()
@@ -229,25 +409,32 @@ def sync(
         int | None,
         typer.Option(help="Limit records per resource (useful for testing)"),
     ] = None,
+    max_pending_deletes: MaxPendingDeletes = DEFAULT_MAX_PENDING_DELETES,
+    verbose: Verbose = False,
+    log: LogFile = None,
 ):
     """
     Sync one organization from POD ResourceSync into the DuckLake. Processes
     every resource (full dump + deltas + deletes) newer than the org's cursor:
     the first run does a full initial load, later runs apply only new deltas.
     """
+    _setup_logging(verbose, log)
     get_config()
     found = resourcesync.get_streams(org_name)
     if not found:
         typer.echo(f"No ResourceSync stream found for {org_name}", err=True)
         raise typer.Exit(code=1)
 
-    con = lake.connect(read_only=False)
+    con = _connect_writable()
     try:
         for name, url in found.items():
-            changed, deleted, n = _sync_org(con, name, url, batch_size, limit)
-            print(
+            changed, deleted, n = _sync_org(
+                con, name, url, batch_size, limit, max_pending_deletes
+            )
+            _summary(
+                f"{name}: {n} resources processed, {changed} changed, {deleted} deleted",
                 f"[bold]{name}[/bold]: {n} resources processed, "
-                f"{changed} changed, {deleted} deleted"
+                f"{changed} changed, {deleted} deleted",
             )
     finally:
         con.close()
@@ -262,24 +449,104 @@ def sync_all(
             "peak memory on constrained machines."
         ),
     ] = 100_000,
+    max_pending_deletes: MaxPendingDeletes = DEFAULT_MAX_PENDING_DELETES,
+    verbose: Verbose = False,
+    log: LogFile = None,
 ):
     """
     Sync every organization from POD ResourceSync into the DuckLake, one at a
     time. Each resource is its own transaction (DuckLake snapshot), so an
     interrupted run resumes cleanly from where it left off.
     """
+    _setup_logging(verbose, log)
     get_config()
 
-    con = lake.connect(read_only=False)
+    con = _connect_writable()
     try:
         for name, url in sorted(resourcesync.get_streams().items()):
-            changed, deleted, n = _sync_org(con, name, url, batch_size, None)
-            print(
+            changed, deleted, n = _sync_org(
+                con, name, url, batch_size, None, max_pending_deletes
+            )
+            _summary(
+                f"{name}: {n} resources processed, {changed} changed, {deleted} deleted",
                 f"[bold]{name}[/bold]: {n} resources processed, "
-                f"{changed} changed, {deleted} deleted"
+                f"{changed} changed, {deleted} deleted",
             )
     finally:
         con.close()
+
+
+def _delete_limit_for(resource_bytes: int, max_pending: int, floor: int) -> int:
+    """
+    The backlog we're willing to carry into applying a resource of this size.
+
+    What kills a sync is a *large* resource meeting a moderate backlog: the
+    delete pays for the tombstones it creates *and* every tombstone already on
+    the files it opens. Small deltas survive a backlog a big one cannot, so hold
+    big ones tighter. Sizes come from the ResourceSync manifest, so this is known
+    before anything is downloaded.
+
+    Never demand less than `floor`, the backlog a rewrite has already proven it
+    cannot get below: asking for the impossible just burns compaction cycles.
+    """
+    limit = max_pending
+    if resource_bytes >= BIG_RESOURCE_BYTES:
+        limit = max(1, max_pending // 2)
+    return max(limit, floor)
+
+
+def _maybe_apply_deletes(
+    con: duckdb.DuckDBPyConnection,
+    org: str,
+    pos: str,
+    resource_bytes: int,
+    max_pending: int,
+    state: dict,
+) -> None:
+    """
+    Apply the accumulated delete backlog before it makes the next apply too
+    expensive. See the README's "delete backlog" section for the why.
+
+    Each rewrite threshold has a floor — it only touches files past that fraction
+    deleted — so when one pass comes up short we rewrite *harder* rather than
+    accept a bigger backlog, which would only defer the failure to a larger
+    resource. Once the lowest threshold can't help either, the backlog is
+    genuinely irreducible: record it so later resources stop paying for
+    compactions that cannot work.
+    """
+    if not max_pending:
+        return
+    limit = _delete_limit_for(resource_bytes, max_pending, state.get("floor", 0))
+    _, pending = lake.pending_deletes(con)
+    if pending <= limit:
+        return
+
+    if pending > BIG_DELETE_BACKLOG:
+        _progress(
+            f"  {pos} {org}: {pending:,} tombstoned rows to apply — this may take a "
+            "long time and cannot be interrupted for partial credit"
+        )
+
+    for threshold in THRESHOLD_LADDER:
+        _progress(
+            f"  {pos} {org}: {pending:,} tombstoned rows pending (> {limit:,}), "
+            f"applying them (threshold {threshold})…"
+        )
+        s = lake.compact(con, days=0, rewrite_deletes=threshold)
+        pending = s["deleted_rows_after"]
+        _progress(
+            f"  {pos} {org}: backlog {s['deleted_rows_before']:,} → {pending:,} rows "
+            f"({s['rewritten']} file(s) rewritten)"
+        )
+        if pending <= limit:
+            return
+
+    state["floor"] = pending
+    _progress(
+        f"  {pos} {org}: {pending:,} tombstoned rows could not be reclaimed even at "
+        f"threshold {MIN_DELETE_THRESHOLD}; continuing, and not retrying below this "
+        "level"
+    )
 
 
 def _sync_org(
@@ -288,6 +555,7 @@ def _sync_org(
     resourcelist_url: str,
     batch_size: int,
     limit: int | None,
+    max_pending_deletes: int = DEFAULT_MAX_PENDING_DELETES,
 ) -> tuple[int, int, int]:
     cursor = lake.get_cursor(con, org)
     resources = resourcesync.get_resources(resourcelist_url)
@@ -296,15 +564,25 @@ def _sync_org(
     total = len(pending)
     if total:
         size = humanize.naturalsize(sum(r.length for r in pending))
-        typer.echo(
-            f"{org}: {total} resource{'' if total == 1 else 's'} to sync ({size})",
-            err=True,
+        _progress(
+            f"{org}: {total} resource{'' if total == 1 else 's'} to sync ({size})"
         )
 
     total_changed = total_deleted = 0
+    delete_state: dict = {}
     for i, resource in enumerate(pending, 1):
         pos = f"[{i}/{total}]"
+        # Clear the backlog *before* applying, while we still know how big this
+        # resource is — a large one gets a stricter limit than a small one.
+        _maybe_apply_deletes(
+            con, org, pos, resource.length, max_pending_deletes, delete_state
+        )
         with tempfile.TemporaryDirectory() as tmp:
+            if _download_bar_hidden():
+                _progress(
+                    f"  {pos} {org} {resource.kind}: downloading "
+                    f"{humanize.naturalsize(resource.length)}…"
+                )
             if resource.kind == "deletes":
                 del_path = Path(tmp) / "deletes.txt"
                 resourcesync.download(
@@ -312,11 +590,11 @@ def _sync_org(
                     del_path,
                     fixity=resource.fixity,
                     desc=f"{pos} {org} {resource.kind}: downloading",
+                    quiet=_LOGGING_TO_FILE,
                 )
                 ids = [f"{org}:{rid}" for rid in resourcesync.read_delete_ids(del_path)]
-                typer.echo(
-                    f"  {pos} {org} deletes: removing {len(ids):,} records from the lake…",
-                    err=True,
+                _progress(
+                    f"  {pos} {org} deletes: removing {len(ids):,} records from the lake…"
                 )
                 _, deleted = lake.apply_resource(
                     con, org, "deletes", ids, resource.lastmod
@@ -330,11 +608,15 @@ def _sync_org(
                     dl_path,
                     fixity=resource.fixity,
                     desc=f"{pos} {org} {resource.kind}: downloading",
+                    quiet=_LOGGING_TO_FILE,
                 )
                 records_pq = Path(tmp) / "records.parquet"
                 meta_pq = Path(tmp) / "meta.parquet"
                 with tqdm(
-                    desc=f"{pos} {org} {resource.kind}", unit=" records", smoothing=0.01
+                    desc=f"{pos} {org} {resource.kind}",
+                    unit=" records",
+                    smoothing=0.01,
+                    disable=_LOGGING_TO_FILE,
                 ) as progress:
                     dump_to_parquet(
                         org,
@@ -347,10 +629,9 @@ def _sync_org(
                     )
                 # apply_resource runs a delete+insert upsert with no progress of
                 # its own; announce it so the wait isn't mistaken for a stall.
-                typer.echo(
+                _progress(
                     f"  {pos} {org} {resource.kind}: updating the lake with "
-                    f"{progress.n:,} records…",
-                    err=True,
+                    f"{progress.n:,} records…"
                 )
                 changed, _ = lake.apply_resource(
                     con, org, resource.kind, (records_pq, meta_pq), resource.lastmod

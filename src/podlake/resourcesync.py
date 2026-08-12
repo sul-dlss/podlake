@@ -109,7 +109,11 @@ def _classify(url: str, mediatype: str) -> str:
 
 
 def download(
-    url: str, path: Path, fixity: str | None = None, desc: str | None = None
+    url: str,
+    path: Path,
+    fixity: str | None = None,
+    desc: str | None = None,
+    quiet: bool = False,
 ) -> Path:
     """
     Stream a POD URL to a local path (following redirects to signed storage
@@ -118,7 +122,8 @@ def download(
 
     Shows a byte progress bar (labelled `desc`) so a large full-dump download
     isn't mistaken for a stall; the bar auto-disables when not attached to a
-    terminal (e.g. cron), so non-interactive runs stay quiet.
+    terminal (e.g. cron), and `quiet` forces it off (e.g. when the caller is
+    logging to a file instead).
     """
     algo = expected = None
     hasher = None
@@ -143,7 +148,7 @@ def download(
             unit="B",
             unit_scale=True,
             unit_divisor=1024,
-            disable=None,
+            disable=True if quiet else None,
         ) as bar:
             for chunk in resp.iter_bytes():
                 output.write(chunk)

@@ -162,31 +162,96 @@ cleanly. Run `sync-all` on a schedule (cron, a systemd timer, a Kubernetes
 CronJob, GitHub Actions) to keep the lake current. Lower `--batch-size` (default
 100000) on memory-constrained machines.
 
-Merging a large resource into the lake can be memory-hungry. Set
-`PODLAKE_MEMORY_LIMIT` (e.g. `10GB` on a 16GB box) to cap DuckDB's RAM — past
-the limit it spills to disk rather than risking the OOM killer. The spill (and
-each resource's download/conversion) goes to `$TMPDIR`, so point that at a roomy
-volume if your default temp dir is small.
+The spill for large operations, and each resource's download/conversion, goes to
+`$TMPDIR` — point that at a roomy volume if your default temp dir is small. Set
+`PODLAKE_MEMORY_LIMIT` (e.g. `10GB` on a 16GB box) to cap DuckDB's buffer pool so
+it spills to disk instead of growing. Note this bounds the *buffer pool* only;
+the delete backlog described next is separate and is not covered by it.
 
-**Compact** reclaims disk. DuckLake is merge-on-read, so every delta, delete,
-and re-imported full dump leaves superseded rows and tombstoned files on disk
-until you clean up. `compact` expires old snapshots, merges small Parquet files,
-and deletes the data files no longer referenced by a live snapshot. Run it after
-a big load (use `--dry-run` first to preview, `podlake status` to sanity-check):
+### The delete backlog
+
+This is the one operational thing worth understanding, because it will break
+writes long before it fills a disk.
+
+DuckLake is merge-on-read: a `DELETE` doesn't rewrite data files, it records the
+removed rows as tombstones alongside them. Every delta upserts — deleting each
+incoming record before inserting its new version — so a routine sync steadily
+accumulates tombstones. In podlake's tall schema one changed record tombstones
+~40 rows, one per subfield, so they build fast.
+
+They aren't just dead weight on disk. **Every `DELETE` loads the full delete
+history of each data file it opens and holds it in memory for the duration of
+the statement** — memory that DuckDB's `memory_limit` does not bound. So the
+backlog, more than the number of rows being deleted, is what decides whether a
+delta fits in RAM. Left to grow, deltas get slower, then memory-hungry, then
+fail outright: on a 32GB machine a 389k-record delta was fine against a 105M-row
+backlog, while a 1.1M-record one was OOM-killed against 153M.
+
+Compacting small files does **not** clear it — file merging skips files that are
+already large, which is where the backlog lives. Only rewriting those files does,
+which is why `compact` does it by default:
 
 ```
-$ uvx podlake compact --dry-run   # preview what would be reclaimed
-$ uvx podlake compact             # expire all but the current snapshot and reclaim
+$ uvx podlake compact                          # reclaim disk + apply deletes
+$ uvx podlake compact --delete-threshold 0.02  # rewrite files ≥2% deleted (slower, reclaims more)
+$ uvx podlake compact --no-rewrite-deletes     # quick disk-only pass
+$ uvx podlake compact --dry-run                # preview without changing anything
+```
+
+Every run reports the backlog, which is the number to watch:
+
+```
+pending deletes: 358 files / 557,856,506 rows → 99 files / 105,293,224 rows
+```
+
+`--delete-threshold` sets how dead a file must be before it's rewritten. Higher
+is cheaper and reclaims less; each threshold has a floor it can't get below, so
+lower it when a run stops making progress. Reclaiming the easy majority is fast
+— on a lake with a 1.5B-row backlog, 93% of it cleared in about 8 minutes — but
+cost per row rises steeply as the remainder thins out.
+
+**Sync manages this for you.** Before applying each resource it checks the
+backlog and clears it if needed, so a long delta chain — a first-time load, or
+months of catch-up — doesn't grow its own memory use until it dies partway
+through. Large resources are held to a stricter limit than small ones, since
+they're what actually run out of memory. Tune with `--max-pending-deletes`
+(default 100M rows; raise it if you have more RAM, `0` disables), and consider
+running the sync under a memory cap so a bad estimate kills only the sync:
+
+```
+$ systemd-run --user --scope -p MemoryMax=24G -p MemorySwapMax=0 \
+    uvx podlake sync-all
+```
+
+For unattended runs, `--log` writes progress to a file, turns off the progress
+bars, and leaves the console quiet — so cron only mails you when something
+actually fails. `--verbose` instead logs each apply step (delete/insert/commit)
+with timings to the terminal, which is how you pin a stall to a statement:
+
+```
+$ uvx podlake sync-all --log /var/log/podlake.log
+$ uvx podlake sync harvard --verbose
 ```
 
 **Publish** shares a local lake read-only by syncing its Parquet and catalog to
 S3; consumers then attach over `s3://` with no database to reach. It's
-incremental (skips files already uploaded), so a typical cycle is `sync-all`
-then `publish`:
+incremental (skips files already uploaded), and additive — it never deletes from
+the bucket, so republishing can't pull a file out from under a running query:
 
 ```
 $ uvx podlake publish s3://your-bucket/pod   # or set PODLAKE_PUBLISH_URL
 ```
+
+So the routine cycle is:
+
+```
+$ uvx podlake sync-all                        # apply new resources
+$ uvx podlake compact                         # reclaim disk, apply deletes
+$ uvx podlake publish s3://your-bucket/pod    # share it
+```
+
+Compacting before publishing also means consumers get files with the deletes
+already applied, rather than paying to merge tombstones on every query.
 
 Two lesser-used commands round things out: `fetch` downloads and converts an
 org's dumps to Parquet **without** loading a lake (for inspection), and `load`
