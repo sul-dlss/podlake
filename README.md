@@ -257,13 +257,45 @@ Two lesser-used commands round things out: `fetch` downloads and converts an
 org's dumps to Parquet **without** loading a lake (for inspection), and `load`
 ingests such a records + meta Parquet pair directly.
 
-### Running the whole pipeline on a schedule
+## Query the lake
 
-[`bin/pipeline.sh`](bin/pipeline.sh) is that cycle plus the dashboard, as one
-cron job: `sync-all`, `compact`, then [podlake-web]'s `refresh`, which recompiles
-the public aggregate JSON from the lake and pushes it — and that push is what
-deploys the [live dashboard][podlake-web-site], via podlake-web's own GitHub
-Actions workflow. Nothing in the script touches GitHub Pages directly.
+For a quick check, query through podlake (it connects read-only):
+
+```
+$ uvx podlake query "SELECT org, count(*) FROM record_meta GROUP BY org"
+```
+
+Analysts usually attach directly with DuckDB, **read-only** so the connection
+can never modify the lake:
+
+```sql
+-- a published lake in a bucket (what most consumers use)
+INSTALL ducklake; INSTALL httpfs;
+ATTACH 'ducklake:s3://your-bucket/pod/podlake.ducklake' AS podlake
+  (DATA_PATH 's3://your-bucket/pod/lake-data/', READ_ONLY, OVERRIDE_DATA_PATH true);
+USE podlake;
+
+-- a local file-catalog lake
+INSTALL ducklake;
+ATTACH 'ducklake:podlake.ducklake' AS podlake (DATA_PATH './lake-data/', READ_ONLY);
+USE podlake;
+```
+
+`OVERRIDE_DATA_PATH true` re-roots the published catalog at the bucket. A public
+bucket needs no credentials; for a private one, consumers supply read-only AWS
+credentials via `CREATE SECRET (TYPE s3, ...)`. Thanks to snapshot isolation the
+maintainer can republish while analysts keep querying, and a reader can pin a
+version with `FROM records AT (VERSION => N)`. See the schema section above for
+query patterns.
+
+## Running the whole pipeline on a schedule
+
+[`bin/pipeline.sh`](bin/pipeline.sh) is the maintenance cycle above plus the
+dashboard, as one cron job: `sync-all`, `compact`, then [podlake-web]'s
+`refresh`, which recompiles the public aggregate JSON from the lake and pushes
+it — and that push is what deploys the [live dashboard][podlake-web-site], via
+podlake-web's own GitHub Actions workflow. Nothing in the script touches GitHub
+Pages directly.
 
 It is one script rather than three scheduled commands because the ordering is
 load-bearing. `sync-all` can leave the lake with one institution's latest dump
@@ -308,7 +340,7 @@ branch for review instead of updating the live site. `flock` keeps a long
 catch-up sync from piling up on the next window: an overlapping run logs a line
 and exits 0.
 
-#### Knowing when it broke
+### Knowing when it broke
 
 cron decides whether to mail by whether the job **wrote something**; the exit
 status has nothing to do with it. Since every step's output goes to the log, the
@@ -321,7 +353,7 @@ nobody ever reads it. Worth confirming the box can actually relay offsite before
 trusting the schedule — an unmonitored pipeline that emails a file nobody opens
 is the same as no notification at all.
 
-#### The GitHub credential
+### The GitHub credential
 
 cron has no SSH agent and no terminal, so the key has to be a **passphrase-less**
 file ssh can read on its own — nothing can answer a prompt, and ssh fails rather
@@ -358,37 +390,6 @@ authenticates, and a deploy key belonging to a *different* repo authenticates
 perfectly well — after which the push fails as "repository not found", which
 reads like a permissions problem and isn't. Leave `DEPLOY_KEY` unset to use
 whatever the account's `~/.ssh/config` already resolves.
-
-## Query the lake
-
-For a quick check, query through podlake (it connects read-only):
-
-```
-$ uvx podlake query "SELECT org, count(*) FROM record_meta GROUP BY org"
-```
-
-Analysts usually attach directly with DuckDB, **read-only** so the connection
-can never modify the lake:
-
-```sql
--- a published lake in a bucket (what most consumers use)
-INSTALL ducklake; INSTALL httpfs;
-ATTACH 'ducklake:s3://your-bucket/pod/podlake.ducklake' AS podlake
-  (DATA_PATH 's3://your-bucket/pod/lake-data/', READ_ONLY, OVERRIDE_DATA_PATH true);
-USE podlake;
-
--- a local file-catalog lake
-INSTALL ducklake;
-ATTACH 'ducklake:podlake.ducklake' AS podlake (DATA_PATH './lake-data/', READ_ONLY);
-USE podlake;
-```
-
-`OVERRIDE_DATA_PATH true` re-roots the published catalog at the bucket. A public
-bucket needs no credentials; for a private one, consumers supply read-only AWS
-credentials via `CREATE SECRET (TYPE s3, ...)`. Thanks to snapshot isolation the
-maintainer can republish while analysts keep querying, and a reader can pin a
-version with `FROM records AT (VERSION => N)`. See the schema section above for
-query patterns.
 
 ## Develop
 
