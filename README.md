@@ -288,6 +288,109 @@ maintainer can republish while analysts keep querying, and a reader can pin a
 version with `FROM records AT (VERSION => N)`. See the schema section above for
 query patterns.
 
+## Running the whole pipeline on a schedule
+
+[`bin/pipeline.sh`](bin/pipeline.sh) is the maintenance cycle above plus the
+dashboard, as one cron job: `sync-all`, `compact`, then [podlake-web]'s
+`refresh`, which recompiles the public aggregate JSON from the lake and pushes
+it — and that push is what deploys the [live dashboard][podlake-web-site], via
+podlake-web's own GitHub Actions workflow. Nothing in the script touches GitHub
+Pages directly.
+
+It is one script rather than three scheduled commands because the ordering is
+load-bearing. `sync-all` can leave the lake with one institution's latest dump
+applied and another's not, and every headline figure on the dashboard compares
+institutions to each other — so `set -e` and a failed sync publishing nothing is
+the point. Stale beats half-synced.
+
+The defaults assume the sibling checkouts podlake-web already requires (it
+depends on podlake by path), so there is nothing to configure:
+
+```
+<pod root>/podlake/        this checkout
+<pod root>/podlake-web/    the dashboard
+<pod root>/logs/           pipeline.log, sync.log, compact.log
+```
+
+```sh
+$ podlake/bin/pipeline.sh                    # run it once by hand and read the log
+$ crontab -e                                 # then schedule it
+MAILTO=you@example.edu
+30 4 * * 1  /opt/app/pod/podlake/bin/pipeline.sh
+```
+
+Everything the script needs is derived from its own location; `PODLAKE_DIR`,
+`POD_ROOT`, `WEB_DIR`, `LOG_DIR`, `LOCK_FILE`, `CATALOG`, `PUBLISH_BRANCH` and
+`DEPLOY_KEY` override the pieces. Two things it can't do for you:
+
+- **podlake's `.env`**, with `PODBUCKET_POD_TOKEN`, in the podlake checkout.
+- **A GitHub credential for podlake-web**, since publishing is a push. See below.
+
+It **never updates either checkout** — deploying code is a decision, not a side
+effect of the schedule. It does check that podlake-web is current before doing
+anything, and if that checkout is behind its upstream it syncs the lake anyway,
+skips the publish, and exits nonzero so cron says so. The check comes first
+because the failure it replaces is a quiet one: `refresh` pushes `HEAD`, so a
+stale checkout has its push rejected *after* the hour-long extract, and the run
+after that finds a clean tree, sees no change against its own unpushed commit,
+and exits 0 — reporting success while the site silently stops updating.
+
+Set `PUBLISH_BRANCH` to something other than `main` to stage the figures on a
+branch for review instead of updating the live site. `flock` keeps a long
+catch-up sync from piling up on the next window: an overlapping run logs a line
+and exits 0.
+
+### Knowing when it broke
+
+cron decides whether to mail by whether the job **wrote something**; the exit
+status has nothing to do with it. Since every step's output goes to the log, the
+script keeps the real stderr on fd 8 and writes a one-line verdict plus the tail
+of the log there on any nonzero exit — so a successful run is silent, and a
+failure is mail you can act on without logging in. `MAILTO` in the crontab is
+what decides where that goes; without it, mail lands in the local spool of the
+account that owns the crontab (`/var/mail/$USER`), which on most hosts means
+nobody ever reads it. Worth confirming the box can actually relay offsite before
+trusting the schedule — an unmonitored pipeline that emails a file nobody opens
+is the same as no notification at all.
+
+### The GitHub credential
+
+cron has no SSH agent and no terminal, so the key has to be a **passphrase-less**
+file ssh can read on its own — nothing can answer a prompt, and ssh fails rather
+than asking. Use a per-repository **deploy key** rather than someone's account
+key: it's scoped to the one repo, revocable without touching a person, and
+doesn't quietly die when they leave.
+
+```sh
+# as the account that runs cron
+$ ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_ed25519_podlake_web
+$ cat ~/.ssh/id_ed25519_podlake_web.pub
+```
+
+Add that public half under podlake-web's **Settings → Deploy keys → Add**, with
+**Allow write access** checked — without it the fetch works and only the push
+fails. Then, once, by hand:
+
+```sh
+$ ssh -T git@github.com     # records github.com in known_hosts; prints which repo the key is for
+$ git -C ../podlake-web remote -v    # origin must be the git@github.com: form, not https
+```
+
+That first `ssh -T` is not optional housekeeping: an unknown host key fails the
+fetch outright, and under cron there's no one to answer the prompt. Point the
+script at the key with `DEPLOY_KEY`, which pins the identity explicitly:
+
+```sh
+DEPLOY_KEY=$HOME/.ssh/id_ed25519_podlake_web /opt/app/pod/podlake/bin/pipeline.sh
+```
+
+That sets `GIT_SSH_COMMAND` with `IdentitiesOnly=yes`, which matters more than it
+looks: otherwise ssh offers every key it can find, GitHub accepts the first that
+authenticates, and a deploy key belonging to a *different* repo authenticates
+perfectly well — after which the push fails as "repository not found", which
+reads like a permissions problem and isn't. Leave `DEPLOY_KEY` unset to use
+whatever the account's `~/.ssh/config` already resolves.
+
 ## Develop
 
 ```
@@ -305,3 +408,5 @@ in-test dumps, and the lake/publish paths against a temporary file-profile lake
 [goldrush]: https://github.com/co-alliance/coalliance-matchkey
 [DuckLake]: https://ducklake.select/
 [mrrc]: https://github.com/dchud/mrrc/blob/main/docs/history/format-research/EVALUATION_PARQUET.md
+[podlake-web]: https://github.com/pod4lib/podlake-web
+[podlake-web-site]: https://pod4lib.github.io/podlake-web/
