@@ -103,6 +103,22 @@ if ! flock -n 9; then
   exit 0
 fi
 
+# Both halves of this pipeline spill large DuckDB operators to disk, and both pick
+# where from Python's tempfile.gettempdir(). That function *probes* TMPDIR and
+# silently falls back to /tmp when it cannot write there — so a TMPDIR naming a
+# directory that does not exist does not fail, it quietly stops applying. The only
+# evidence is a "spilling to /tmp" line in this log, and the consequence is tens of
+# GiB landing on whatever volume holds /tmp: possibly small, possibly a tmpfs, in
+# which case it is spilling memory into memory and the spill was pointless.
+#
+# Created here rather than assumed, and fatal if it cannot be. Setting TMPDIR and
+# having it silently ignored is the exact failure this prevents, which is not worth
+# trading for a run that "succeeds" while spilling somewhere else.
+if [ -n "${TMPDIR:-}" ]; then
+  mkdir -p "$TMPDIR"
+  echo "spill directory: $TMPDIR"
+fi
+
 # --- 0. is the dashboard code current? ---------------------------------------
 # A check, deliberately not a `git pull`: updating podlake-web's code is a deploy,
 # and a deploy should be somebody's decision rather than a side effect of the
