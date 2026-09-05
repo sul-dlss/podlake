@@ -631,26 +631,36 @@ def _sync_org(
                 )
                 records_pq = Path(tmp) / "records.parquet"
                 meta_pq = Path(tmp) / "meta.parquet"
+                # Track the count ourselves rather than reading progress.n:
+                # update() is a no-op on a bar disabled by --log, so n would
+                # stay 0 in exactly the runs whose log we go back and read.
+                seen = 0
                 with tqdm(
                     desc=f"{pos} {org} {resource.kind}",
                     unit=" records",
                     smoothing=0.01,
                     disable=_LOGGING_TO_FILE,
                 ) as progress:
+
+                    def on_record(count: int, bar: tqdm = progress) -> None:
+                        nonlocal seen
+                        seen = count
+                        bar.update(1)
+
                     dump_to_parquet(
                         org,
                         dl_path,
                         records_pq,
                         meta_pq,
                         batch_size=batch_size,
-                        on_record=lambda _: progress.update(1),
+                        on_record=on_record,
                         limit=limit,
                     )
                 # apply_resource runs a delete+insert upsert with no progress of
                 # its own; announce it so the wait isn't mistaken for a stall.
                 _progress(
                     f"  {pos} {org} {resource.kind}: updating the lake with "
-                    f"{progress.n:,} records…"
+                    f"{seen:,} records…"
                 )
                 changed, _ = lake.apply_resource(
                     con, org, resource.kind, (records_pq, meta_pq), resource.lastmod

@@ -287,6 +287,9 @@ def test_sync_log_file_quiets_console(tmp_path, monkeypatch):
     written = log.read_text()
     assert "downloading" in written
     assert "resources processed" in written
+    # The record count must survive the bar being disabled: tqdm.update() is a
+    # no-op on a disabled bar, so reading progress.n logged "0 records" here
+    assert "updating the lake with 2 records" in written
     # httpx's per-request chatter would bury our progress lines
     assert "HTTP Request" not in written
 
